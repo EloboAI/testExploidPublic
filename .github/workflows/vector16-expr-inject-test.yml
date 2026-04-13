@@ -27,16 +27,11 @@ jobs:
           echo "=== 16J-B: Unsafe interpolation test ===" > unsafe_result.txt
           echo "This step demonstrates the vulnerability pattern." >> unsafe_result.txt
           echo "Input (SAFE via heredoc):" >> unsafe_result.txt
-          cat << 'PAYLOAD_EOF' >> unsafe_result.txt
-          ${{ github.event.inputs.payload }}
-          PAYLOAD_EOF
+          echo '${{ github.event.inputs.payload }}' >> unsafe_result.txt
           echo "" >> unsafe_result.txt
 
           # Now test: was the input evaluated as an expression?
-          INPUT_RAW=$(cat << 'RAW_EOF'
-          ${{ github.event.inputs.payload }}
-          RAW_EOF
-          )
+          INPUT_RAW='${{ github.event.inputs.payload }}'
           if echo "$INPUT_RAW" | grep -qE "^ghs_|^ghp_|^github_pat_"; then
             echo "🔴 CRITICAL: Expression was evaluated — token leaked!" >> unsafe_result.txt
           elif [[ "$INPUT_RAW" == *'$'* ]]; then

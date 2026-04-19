@@ -1,0 +1,30 @@
+name: Unicode RefName Eval Test
+on:
+  push:
+    branches: ['**']
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate ref_name normalization
+        run: |
+          echo "github.ref_name = '${{ github.ref_name }}'"
+          echo "github.ref = '${{ github.ref }}'"
+          python3 -c "
+          import unicodedata
+          ref = '${{ github.ref_name }}'
+          ascii_main = 'main'
+          print(f'ref_name repr: {repr(ref)}')
+          print(f'ref_bytes: {ref.encode('utf-8').hex()}')
+          print(f'byte_eq_main: {ref == ascii_main}')
+          print(f'nfkc_eq_main: {unicodedata.normalize('NFKC', ref) == ascii_main}')
+          "
+
+      - name: Conditional on ref_name == main (exact)
+        if: github.ref_name == 'main'
+        run: echo "CONDITION TRUE — github.ref_name == 'main' matched on Unicode branch!"
+
+      - name: Conditional on contains(ref_name, 'main')
+        if: contains(github.ref_name, 'main')
+        run: echo "CONTAINS TRUE — contains(ref_name, main) matched"

@@ -1,0 +1,9 @@
+name: Protected Branch Trigger Test
+on:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "TRIGGERED on branch $GITHUB_REF_NAME"
